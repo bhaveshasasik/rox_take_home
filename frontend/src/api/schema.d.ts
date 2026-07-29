@@ -743,6 +743,8 @@ export interface components {
             recipient?: string | null;
             /** Error */
             error?: string | null;
+            /** Digest Id */
+            digest_id?: string | null;
         };
         /**
          * EmailStatus

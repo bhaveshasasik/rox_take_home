@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     llm_expansion_score_threshold: int = 85
 
     # Notifications
+    #: Digest inclusion floor, independent of the creation threshold above.
+    #: Sub-threshold opportunities are created and visible in the pipeline,
+    #: never emailed — the reviewer's inbox gets the strong signals, the queue
+    #: keeps everything.
+    notification_score_threshold: int = 80
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""

@@ -22,6 +22,8 @@ from app.logging_config import get_logger
 from app.models import (
     Account,
     Channel,
+    Digest,
+    DigestOpportunity,
     Notification,
     NotificationStatus,
     Opportunity,
@@ -264,6 +266,52 @@ def _entry_lines(opportunity: Opportunity, account_name: str, base_url: str) -> 
 
 
 # ----------------------------------------------------------------------
+# Digest eligibility — the one query every send path shares
+# ----------------------------------------------------------------------
+
+
+async def digest_eligible(session: AsyncSession) -> list[tuple[Opportunity, str]]:
+    """Opportunities a digest may include, strongest first.
+
+    The single definition of eligible: at or above the notification score
+    floor, still undecided, and not a member of any prior digest that was —
+    or still may be — delivered. Every send path reads this; none builds its
+    own query, because two paths with two queries is how the same
+    opportunity gets emailed twice.
+
+    Membership in a *failed* digest does not consume eligibility: nothing
+    reached the reviewer, so the rows belong in the next attempt. Pending
+    does consume it — digest rows are written before the send, per the same
+    attempt-before-send rule Notifications follow, and a digest stuck in
+    pending is an operator-visible problem rather than a license to double
+    send.
+    """
+    settings = get_settings()
+
+    consumed = (
+        select(DigestOpportunity.opportunity_id)
+        .join(Digest, Digest.id == DigestOpportunity.digest_id)
+        .where(Digest.status != NotificationStatus.FAILED.value)
+    )
+
+    rows = await session.execute(
+        select(Opportunity, Account.name)
+        .join(Account, Opportunity.account_id == Account.id)
+        .where(
+            Opportunity.status == OpportunityStatus.NEW.value,
+            Opportunity.qualification_score >= settings.notification_score_threshold,
+            Opportunity.id.not_in(consumed),
+        )
+        .order_by(
+            Opportunity.qualification_score.desc(),
+            Opportunity.created_at,
+            Opportunity.id,
+        )
+    )
+    return [(opp, name) for opp, name in rows.all()]
+
+
+# ----------------------------------------------------------------------
 # Batch — the top N queued opportunities, sent as one email
 # ----------------------------------------------------------------------
 
@@ -284,17 +332,9 @@ async def notify_batch(
     size = batch_size if batch_size is not None else settings.notification_batch_size
     base_url = settings.app_base_url.rstrip("/")
 
-    pending = (
-        await session.execute(
-            select(Opportunity, Account.name)
-            .join(Account, Opportunity.account_id == Account.id)
-            .where(
-                Opportunity.status == OpportunityStatus.NEW.value,
-                Opportunity.notified_at.is_(None),
-            )
-            .order_by(Opportunity.qualification_score.desc())
-        )
-    ).all()
+    # The shared eligibility query — score floor, undecided, not already a
+    # member of a delivered digest. Not a private variant of it.
+    pending = await digest_eligible(session)
 
     if len(pending) < size:
         return {"sent": False, "queued": len(pending)}
@@ -306,8 +346,23 @@ async def notify_batch(
         log.warning("batch not sent — no email channel configured")
         return {"sent": False, "queued": len(pending)}
 
+    # Digest + membership before the send, like Notification rows: an SMTP
+    # outage must be visible in the tables, and membership is what stops the
+    # next path from re-sending these opportunities.
+    digest = Digest(
+        channel=Channel.EMAIL.value,
+        recipient=to,
+        trigger="batch",
+        status=NotificationStatus.PENDING.value,
+    )
+    session.add(digest)
+    await session.flush()
+
     records = []
     for opp, _account_name in batch:
+        session.add(
+            DigestOpportunity(digest_id=digest.id, opportunity_id=opp.id)
+        )
         record = Notification(
             opportunity_id=opp.id,
             channel=Channel.EMAIL.value,
@@ -327,6 +382,8 @@ async def notify_batch(
     try:
         await _send_email(to=to, subject=subject, body=body)
     except Exception as exc:  # noqa: BLE001 - surface the failure, don't raise
+        digest.status = NotificationStatus.FAILED.value
+        digest.error = str(exc)[:2000]
         for record in records:
             record.status = NotificationStatus.FAILED.value
             record.error = str(exc)[:2000]
@@ -335,6 +392,8 @@ async def notify_batch(
         return {"sent": False, "queued": len(pending), "error": str(exc)[:2000]}
 
     now = utcnow()
+    digest.status = NotificationStatus.SENT.value
+    digest.sent_at = now
     for record, (opp, _account_name) in zip(records, batch):
         record.status = NotificationStatus.SENT.value
         record.sent_at = now
@@ -344,7 +403,7 @@ async def notify_batch(
 
     await session.commit()
     log.info("batch notification sent", count=len(batch), recipient=to)
-    return {"sent": True, "count": len(batch), "recipient": to}
+    return {"sent": True, "count": len(batch), "recipient": to, "digest_id": digest.id}
 
 
 # ----------------------------------------------------------------------
@@ -352,51 +411,81 @@ async def notify_batch(
 # ----------------------------------------------------------------------
 
 
-async def build_digest(session: AsyncSession) -> tuple[str, str, int]:
-    """Return (subject, body, count) for every opportunity pending review."""
-    settings = get_settings()
-    base_url = settings.app_base_url.rstrip("/")
+def build_digest(
+    rows: list[tuple[Opportunity, str]], base_url: str
+) -> tuple[str, str]:
+    """Return (subject, body) for the given eligible opportunities.
 
-    rows = (
-        await session.execute(
-            select(Opportunity, Account.name)
-            .join(Account, Opportunity.account_id == Account.id)
-            .where(Opportunity.status == OpportunityStatus.NEW.value)
-            .order_by(Opportunity.created_at.desc())
-        )
-    ).all()
-
+    Pure formatting over rows the caller already selected — eligibility lives
+    in `digest_eligible`, nowhere else. There is no empty-state message
+    because an empty digest is never sent: no qualifying opportunities means
+    no email, not a friendlier email.
+    """
     lines = ["Today's Opportunities", "-" * 21, ""]
-    if not rows:
-        lines.append("Nothing is waiting for review right now.")
-    else:
-        lines.append(f"{len(rows)} account{'s' if len(rows) != 1 else ''} ready for your review.")
-        for opp, account_name in rows:
-            lines.extend(_entry_lines(opp, account_name, base_url))
+    lines.append(f"{len(rows)} account{'s' if len(rows) != 1 else ''} ready for your review.")
+    for opp, account_name in rows:
+        lines.extend(_entry_lines(opp, account_name, base_url))
 
     body = "\n".join(lines).rstrip() + "\n"
-    subject = (
-        f"[Rox Pipeline] {len(rows)} opportunit{'ies' if len(rows) != 1 else 'y'} to review today"
-        if rows
-        else "[Rox Pipeline] No opportunities to review today"
-    )
-    return subject, body, len(rows)
+    subject = f"[Rox Pipeline] {len(rows)} opportunit{'ies' if len(rows) != 1 else 'y'} to review today"
+    return subject, body
 
 
-async def send_digest(session: AsyncSession) -> dict:
-    """Email everything currently awaiting review as one digest."""
-    subject, body, count = await build_digest(session)
+async def send_digest(
+    session: AsyncSession,
+    *,
+    trigger: str = "manual",
+    run_id: str | None = None,
+) -> dict:
+    """Email every digest-eligible opportunity as one message, with a record.
+
+    Writes the Digest row and its memberships *before* sending — the same
+    attempt-before-send rule Notification rows follow, and the membership is
+    what makes running this twice in a row send nothing the second time.
+    """
+    settings = get_settings()
+    eligible = await digest_eligible(session)
+
+    if not eligible:
+        log.info("digest skipped — nothing eligible")
+        return {"sent": False, "count": 0}
+
     to = _configured_recipient()
-
     if to is None:
         log.warning("digest not sent — no email channel configured")
-        return {"sent": False, "count": count}
+        return {"sent": False, "count": len(eligible)}
+
+    digest = Digest(
+        channel=Channel.EMAIL.value,
+        recipient=to,
+        trigger=trigger,
+        run_id=run_id,
+        status=NotificationStatus.PENDING.value,
+    )
+    session.add(digest)
+    await session.flush()
+    for opp, _name in eligible:
+        session.add(DigestOpportunity(digest_id=digest.id, opportunity_id=opp.id))
+    await session.flush()
+
+    subject, body = build_digest(eligible, settings.app_base_url.rstrip("/"))
 
     try:
         await _send_email(to=to, subject=subject, body=body)
     except Exception as exc:  # noqa: BLE001 - surface the failure, don't raise
+        digest.status = NotificationStatus.FAILED.value
+        digest.error = str(exc)[:2000]
+        await session.commit()
         log.error("digest failed", error=str(exc)[:2000])
-        return {"sent": False, "count": count, "error": str(exc)[:2000]}
+        return {"sent": False, "count": len(eligible), "error": str(exc)[:2000]}
 
-    log.info("digest sent", count=count, recipient=to)
-    return {"sent": True, "count": count, "recipient": to}
+    digest.status = NotificationStatus.SENT.value
+    digest.sent_at = utcnow()
+    await session.commit()
+    log.info("digest sent", count=len(eligible), recipient=to, digest_id=digest.id)
+    return {
+        "sent": True,
+        "count": len(eligible),
+        "recipient": to,
+        "digest_id": digest.id,
+    }

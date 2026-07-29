@@ -352,6 +352,55 @@ class Notification(Base):
     opportunity: Mapped[Opportunity] = relationship(back_populates="notifications")
 
 
+class Digest(Base):
+    """One multi-opportunity email, with its membership recorded.
+
+    The grouping `notify_batch` never had and `send_digest` never wrote: which
+    opportunities a given send actually contained. Membership is what makes
+    digest-level dedupe enforceable — "not the same information twice" needs a
+    record of what was sent the first time.
+    """
+
+    __tablename__ = "digests"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    channel: Mapped[str] = mapped_column(String(32), default=Channel.EMAIL.value)
+    recipient: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: what caused the send: "manual", "batch", "scheduled", "backfill"
+    trigger: Mapped[str] = mapped_column(String(32), default="manual")
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("research_runs.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default=NotificationStatus.PENDING.value, index=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+    memberships: Mapped[list[DigestOpportunity]] = relationship(
+        back_populates="digest", cascade="all, delete-orphan"
+    )
+
+
+class DigestOpportunity(Base):
+    """One opportunity's inclusion in one digest."""
+
+    __tablename__ = "digest_opportunities"
+    __table_args__ = (
+        UniqueConstraint("digest_id", "opportunity_id", name="uq_digest_member"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    digest_id: Mapped[str] = mapped_column(ForeignKey("digests.id"), index=True)
+    opportunity_id: Mapped[str] = mapped_column(
+        ForeignKey("opportunities.id"), index=True
+    )
+
+    digest: Mapped[Digest] = relationship(back_populates="memberships")
+    opportunity: Mapped[Opportunity] = relationship()
+
+
 # --------------------------------------------------------------------------
 # Prospecting
 # --------------------------------------------------------------------------

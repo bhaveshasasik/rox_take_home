@@ -129,9 +129,11 @@ class TestBatchNotification:
             .all()
         )
         low, high, mid = opps
-        low.qualification_score = 60
-        high.qualification_score = 90
-        mid.qualification_score = 75
+        # all above the notification floor — this test is about ordering and
+        # the queue, not the floor (that has its own tests)
+        low.qualification_score = 85
+        high.qualification_score = 95
+        mid.qualification_score = 90
         await session.commit()
 
         with (
@@ -143,7 +145,10 @@ class TestBatchNotification:
         ):
             result = await notify_batch(session, batch_size=2)
 
-        assert result == {"sent": True, "count": 2, "recipient": "reviewer@example.com"}
+        assert result["sent"] is True
+        assert result["count"] == 2
+        assert result["recipient"] == "reviewer@example.com"
+        assert result["digest_id"], "the batch send is recorded as a digest"
 
         for opp in (low, high, mid):
             await session.refresh(opp)
@@ -198,46 +203,132 @@ class TestBatchNotification:
 
 
 class TestDigest:
-    async def test_includes_every_pending_opportunity(self, session, seeded):
-        from app.services.notifications import build_digest
+    def _delivery(self):
+        """Patched SMTP + recipient, capturing every send."""
+        from unittest.mock import patch
+
+        sent: list[dict] = []
+
+        async def capture(*, to, subject, body):
+            sent.append({"to": to, "subject": subject, "body": body})
+
+        return sent, (
+            patch("app.services.notifications._send_email", capture),
+            patch(
+                "app.services.notifications._configured_recipient",
+                return_value="reviewer@example.com",
+            ),
+        )
+
+    async def test_includes_every_eligible_opportunity(self, session, seeded):
+        from app.services.notifications import send_digest
 
         opps = (await session.execute(select(Opportunity))).scalars().all()
-        subject, body, count = await build_digest(session)
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            result = await send_digest(session)
 
-        assert count == len(opps) == 3
-        assert "3 opportunities to review" in subject
+        assert result["sent"] is True and result["count"] == len(opps) == 3
+        assert "3 opportunities to review" in sent[0]["subject"]
         for opp in opps:
-            assert f"/opportunities/{opp.id}" in body
+            assert f"/opportunities/{opp.id}" in sent[0]["body"]
+
+    async def test_below_the_floor_is_created_but_never_emailed(self, session, seeded):
+        """The two thresholds stay separate: creation at 60, notification at
+        80. A 79 exists in the pipeline and is absent from the email."""
+        from app.services.notifications import send_digest
+
+        opps = (await session.execute(select(Opportunity))).scalars().all()
+        opps[0].qualification_score = 79
+        await session.commit()
+
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            result = await send_digest(session)
+
+        assert result["count"] == 2
+        assert f"/opportunities/{opps[0].id}" not in sent[0]["body"]
 
     async def test_omits_the_score(self, session, seeded):
-        from app.services.notifications import build_digest
+        from app.services.notifications import send_digest
 
         opps = (await session.execute(select(Opportunity))).scalars().all()
-        _, body, _ = await build_digest(session)
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            await send_digest(session)
 
         for opp in opps:
-            assert f"{opp.qualification_score}/100" not in body
-        assert "score" not in body.lower()
+            assert f"{opp.qualification_score}/100" not in sent[0]["body"]
+        assert "score" not in sent[0]["body"].lower()
 
     async def test_link_is_the_last_line_of_each_entry(self, session, seeded):
-        from app.services.notifications import build_digest
+        from app.services.notifications import send_digest
 
-        _, body, _ = await build_digest(session)
-        # every non-empty paragraph block ends with its review link
-        blocks = [b for b in body.split("\n\n") if b.strip()]
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            await send_digest(session)
+
+        blocks = [b for b in sent[0]["body"].split("\n\n") if b.strip()]
         for block in blocks[2:]:  # skip the title block and the summary line
             assert block.strip().splitlines()[-1].startswith("Review: http")
 
-    async def test_empty_state_is_friendly(self, session):
-        from app.services.notifications import build_digest
+    async def test_nothing_eligible_sends_nothing(self, session):
+        """No qualifying opportunities, no digest — not a friendlier email."""
+        from app.services.notifications import send_digest
 
-        subject, body, count = await build_digest(session)
-        assert count == 0
-        assert "No opportunities" in subject
-        assert "Nothing is waiting" in body
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            result = await send_digest(session)
 
-    async def test_endpoint_triggers_a_send(self, session, seeded, client):
+        assert result == {"sent": False, "count": 0}
+        assert sent == [], "an empty digest must not reach SMTP"
+
+    async def test_second_run_sends_nothing(self, session, seeded):
+        """The acceptance criterion: membership consumes eligibility, so
+        running the digest twice in a row sends nothing the second time."""
+        from app.models import Digest, DigestOpportunity
+        from app.services.notifications import send_digest
+
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            first = await send_digest(session)
+            second = await send_digest(session)
+
+        assert first["sent"] is True and first["count"] == 3
+        assert second == {"sent": False, "count": 0}
+        assert len(sent) == 1, "exactly one email across the two runs"
+
+        digests = (await session.execute(select(Digest))).scalars().all()
+        members = (await session.execute(select(DigestOpportunity))).scalars().all()
+        assert len(digests) == 1 and digests[0].status == "sent"
+        assert len(members) == 3
+
+    async def test_failed_digest_frees_its_members(self, session, seeded):
+        """Nothing reached the reviewer, so the rows belong to the next
+        attempt — a failed send must not consume eligibility."""
         from unittest.mock import AsyncMock, patch
+
+        from app.services.notifications import digest_eligible, send_digest
+
+        with patch(
+            "app.services.notifications._send_email",
+            AsyncMock(side_effect=RuntimeError("smtp down")),
+        ), patch(
+            "app.services.notifications._configured_recipient",
+            return_value="reviewer@example.com",
+        ):
+            result = await send_digest(session)
+
+        assert result["sent"] is False and "smtp down" in result["error"]
+        assert len(await digest_eligible(session)) == 3
+
+    async def test_batch_records_membership_too(self, session, seeded):
+        """notify_batch is a send path like any other — what it sends is
+        consumed, and a digest after it finds nothing left."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.models import DigestOpportunity
+        from app.services.notifications import digest_eligible
 
         with patch(
             "app.services.notifications._send_email", AsyncMock(return_value=None)
@@ -245,11 +336,33 @@ class TestDigest:
             "app.services.notifications._configured_recipient",
             return_value="reviewer@example.com",
         ):
+            result = await notify_batch(session, batch_size=3)
+
+        assert result["sent"] is True
+        members = (await session.execute(select(DigestOpportunity))).scalars().all()
+        assert len(members) == 3
+        assert await digest_eligible(session) == []
+
+    async def test_decided_is_not_eligible(self, session, seeded, client):
+        from app.services.notifications import digest_eligible
+
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        await client.post(
+            f"/opportunities/{opp.id}/decision",
+            json={"decision": "accept", "decided_by": "rep@acme.com"},
+        )
+        eligible_ids = {o.id for o, _name in await digest_eligible(session)}
+        assert opp.id not in eligible_ids
+
+    async def test_endpoint_triggers_a_send(self, session, seeded, client):
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
             resp = await client.post("/admin/notifications/digest")
 
         assert resp.status_code == 200
         assert resp.json()["sent"] is True
         assert resp.json()["count"] == 3
+        assert resp.json()["digest_id"]
 
 
 class TestOpportunityApi:

@@ -453,6 +453,8 @@ class DigestResultOut(BaseModel):
     count: int
     recipient: str | None = None
     error: str | None = None
+    #: set when a Digest row was written, whatever the send outcome
+    digest_id: str | None = None
 
 
 class HealthOut(BaseModel):
