@@ -88,7 +88,13 @@ def _preview(text: str | None, width: int = 96) -> str:
     return flat if len(flat) <= width else f"{flat[: width - 1]}…"
 
 
-async def rescore(*, dry_run: bool, include_decided: bool, rewrite_prose: bool) -> None:
+async def rescore(
+    *,
+    dry_run: bool,
+    include_decided: bool,
+    rewrite_prose: bool,
+    only: set[str] | None = None,
+) -> None:
     await init_db()
     threshold = get_settings().opportunity_score_threshold
 
@@ -110,6 +116,9 @@ async def rescore(*, dry_run: bool, include_decided: bool, rewrite_prose: bool) 
         print("-" * 72)
 
         for opportunity, account_name in rows:
+            if only is not None and account_name not in only:
+                continue
+
             if opportunity.status != OpportunityStatus.NEW.value and not include_decided:
                 skipped_decided += 1
                 continue
@@ -220,12 +229,23 @@ def main() -> None:
         action="store_true",
         help="also rebuild rationale and title via write_brief (calls the Anthropic API)",
     )
+    # `write_brief` is not deterministic, so --rewrite-prose reports every row as
+    # changed even when only the wording moved. Without a way to target the rows
+    # whose signals actually changed, a blanket run rewrites good prose to no
+    # effect and bills a call for each. Scope it by account instead.
+    parser.add_argument(
+        "--account",
+        action="append",
+        metavar="NAME",
+        help="limit to this account (repeatable); matches Account.name exactly",
+    )
     args = parser.parse_args()
     asyncio.run(
         rescore(
             dry_run=args.dry_run,
             include_decided=args.include_decided,
             rewrite_prose=args.rewrite_prose,
+            only=set(args.account) if args.account else None,
         )
     )
 
