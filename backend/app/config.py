@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Research cycle
+    #: Daily run time, "HH:MM", 24-hour, UTC. The production cadence: one cron
+    #: run per day, early enough that the digest lands before the workday. An
+    #: explicit time is reviewable in a way an interval count never was.
+    #: Invalid values fail at startup rather than degrade — a pipeline
+    #: silently running on the wrong cadence looks identical to one working.
+    research_run_at: str = "07:00"
+    #: Fallback cadence, used only when `research_run_at` is blank. Demoted
+    #: from the primary knob: kept for calibration work, where a short
+    #: interval is the point, not for production.
     research_interval_minutes: int = 15
     research_run_on_startup: bool = False
     #: Set false to keep the API up while stopping the recurring cycle. Needed
