@@ -35,8 +35,23 @@ from app.signals.service import scored_for_artifact
 log = get_logger(__name__)
 
 
+#: How much a new score must clear an open opportunity's score by to
+#: supersede it. The score's quantum is 10 — the base is driver confidence
+#: × 10 — and secondary factors jitter by ±5; observed run-over-run drift on
+#: the same account (fresh research, same fundamentals) was −5, −11 and −26,
+#: so a margin of 10 sits inside noise and would churn. 15 is one full
+#: confidence step plus jitter. The deadlock cases this exists for — an
+#: account stuck behind a 0-score opportunity while an 85 waits — clear any
+#: sane margin.
+SUPERSEDE_MARGIN = 15
+
+
 async def should_skip_account(
-    session: AsyncSession, account_id: str, signal_type: str | None = None
+    session: AsyncSession,
+    account_id: str,
+    signal_type: str | None = None,
+    *,
+    new_score: int | None = None,
 ) -> str | None:
     """Return a reason to skip this account, or None to proceed.
 
@@ -47,7 +62,11 @@ async def should_skip_account(
 
     Two guards:
       1. An undecided opportunity is already waiting on the reviewer — don't
-         stack duplicates on their queue.
+         stack duplicates on their queue. Score-aware when `new_score` is
+         given: a candidate clearing the open score by `SUPERSEDE_MARGIN`
+         closes the open one as superseded and proceeds, because otherwise an
+         unreviewed low score blocks its account forever — the cooldown never
+         engages, since it keys off a decision that never happens.
       2. A decision was made recently — respect it for a cooldown window rather
          than re-asking every cycle.
     """
@@ -62,7 +81,23 @@ async def should_skip_account(
         )
     ).scalars().first()
     if open_existing is not None:
-        return f"open opportunity {open_existing.id} already pending review"
+        supersedes = (
+            new_score is not None
+            and new_score >= open_existing.qualification_score + SUPERSEDE_MARGIN
+        )
+        if not supersedes:
+            return f"open opportunity {open_existing.id} already pending review"
+
+        # Terminal but undecided: no Decision row, decided_at stays NULL, so
+        # neither the cooldown nor any decision-based report picks it up.
+        open_existing.status = OpportunityStatus.SUPERSEDED.value
+        log.info(
+            "opportunity superseded",
+            account_id=account_id,
+            superseded_id=open_existing.id,
+            old_score=open_existing.qualification_score,
+            new_score=new_score,
+        )
 
     cutoff = utcnow() - timedelta(days=settings.opportunity_cooldown_days)
     recent = (
@@ -160,7 +195,9 @@ async def create_opportunities_for_run(
             )
             continue
 
-        skip_reason = await should_skip_account(session, artifact.account_id)
+        skip_reason = await should_skip_account(
+            session, artifact.account_id, new_score=parsed.score
+        )
         if skip_reason:
             log.info(
                 "skipping duplicate opportunity", account=account.name, reason=skip_reason

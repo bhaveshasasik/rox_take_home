@@ -440,6 +440,47 @@ class TestDedupe:
         reason = await should_skip_account(session, account.id)
         assert reason and "pending review" in reason
 
+    async def test_open_opportunity_blocks_scores_inside_the_margin(self, session):
+        """A candidate that does not clear SUPERSEDE_MARGIN is a re-roll, not a
+        stronger signal — the open opportunity keeps its place in the queue."""
+        from app.services.opportunities import SUPERSEDE_MARGIN
+
+        account, opp = await self._seed(session, status=OpportunityStatus.NEW.value)
+        reason = await should_skip_account(
+            session, account.id, new_score=opp.qualification_score + SUPERSEDE_MARGIN - 1
+        )
+        assert reason and "pending review" in reason
+        assert opp.status == OpportunityStatus.NEW.value
+
+    async def test_materially_higher_score_supersedes(self, session):
+        """The deadlock fix: an unreviewed low score must not block its account
+        forever once a materially stronger signal arrives."""
+        from app.services.opportunities import SUPERSEDE_MARGIN
+
+        account, opp = await self._seed(session, status=OpportunityStatus.NEW.value)
+        reason = await should_skip_account(
+            session, account.id, new_score=opp.qualification_score + SUPERSEDE_MARGIN
+        )
+        assert reason is None, "the account must be free for the stronger signal"
+        assert opp.status == OpportunityStatus.SUPERSEDED.value
+        # Terminal but undecided: no decision timestamp, so neither the
+        # cooldown nor decision-based reporting may ever pick it up.
+        assert opp.decided_at is None
+
+    async def test_supersede_needs_a_score(self, session):
+        """Callers that don't pass new_score keep the old unconditional block."""
+        account, opp = await self._seed(session, status=OpportunityStatus.NEW.value)
+        assert await should_skip_account(session, account.id, new_score=None)
+        assert opp.status == OpportunityStatus.NEW.value
+
+    async def test_superseded_does_not_trigger_cooldown(self, session):
+        """A superseded row is not a decision — the account resurfaces on the
+        next run rather than entering the 7-day cooldown."""
+        account, _ = await self._seed(
+            session, status=OpportunityStatus.SUPERSEDED.value
+        )
+        assert await should_skip_account(session, account.id) is None
+
     async def test_dedupe_is_per_account_not_per_signal(self, session):
         """signal_type is derived from the cell's own label and can drift between
         runs, so a different label must not let a duplicate through."""

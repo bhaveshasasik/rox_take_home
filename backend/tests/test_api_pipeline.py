@@ -579,6 +579,41 @@ class TestReporting:
             await run_prospecting(session, opp, LocalProspectingProvider())
         return opps
 
+    async def test_superseded_is_invisible_to_decision_reporting(
+        self, session, seeded, client
+    ):
+        """Superseded is terminal without a decision: it must not count as
+        reviewed, decided, pending, or against any acceptance rate — while the
+        funnel still counts it at the stage it reached (created, here)."""
+        opps = await self._decide_all(session, client)
+        before = (await client.get("/reporting/overview")).json()
+
+        superseded = opps[0]
+        superseded.status = OpportunityStatus.SUPERSEDED.value
+        await session.commit()
+
+        after = (await client.get("/reporting/overview")).json()
+
+        # created cohort unchanged — it existed, and the funnel keeps it
+        assert (
+            after["funnel"]["steps"][0]["count"]
+            == before["funnel"]["steps"][0]["count"]
+        )
+        # but it is no longer accepted, reviewed, decided, or pending anywhere
+        assert after["headline"]["accepted"] == before["headline"]["accepted"] - 1
+        assert after["headline"]["pending_review"] == before["headline"]["pending_review"]
+        assert (
+            after["score_calibration"]["total_decided"]
+            == before["score_calibration"]["total_decided"] - 1
+        )
+        reviewed_before = next(
+            s for s in before["funnel"]["steps"] if s["stage"] == "reviewed"
+        )
+        reviewed_after = next(
+            s for s in after["funnel"]["steps"] if s["stage"] == "reviewed"
+        )
+        assert reviewed_after["count"] == reviewed_before["count"] - 1
+
     async def test_overview_has_every_section(self, session, seeded, client):
         resp = await client.get("/reporting/overview")
         assert resp.status_code == 200
@@ -1128,7 +1163,12 @@ class TestEnumSerialization:
         """The whole point: the generated client gets a union, not `string`."""
         schemas = (await client.get("/openapi.json")).json()["components"]["schemas"]
 
-        assert schemas["OpportunityStatus"]["enum"] == ["new", "accepted", "rejected"]
+        assert schemas["OpportunityStatus"]["enum"] == [
+            "new",
+            "accepted",
+            "rejected",
+            "superseded",
+        ]
         status = schemas["OpportunityOut"]["properties"]["status"]
         assert status["$ref"].endswith("OpportunityStatus")
         assert schemas["FunnelStepOut"]["properties"]["stage"]["$ref"].endswith("Stage")

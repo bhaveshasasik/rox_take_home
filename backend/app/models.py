@@ -84,6 +84,11 @@ class OpportunityStatus(str, enum.Enum):
     NEW = "new"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+    #: Closed because a materially stronger signal arrived on the same account
+    #: before anyone reviewed this one. Terminal, but carries no human
+    #: decision: `decided_at` stays NULL, no Decision row exists, and nothing
+    #: that reports on acceptance or rejection may count it.
+    SUPERSEDED = "superseded"
 
 
 class Stage(str, enum.Enum):

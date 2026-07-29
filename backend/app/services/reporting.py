@@ -155,7 +155,11 @@ async def _headline(
     rejected = await _count(
         session, Opportunity.status == OpportunityStatus.REJECTED.value, *window
     )
-    pending = total - accepted - rejected
+    # Counted, not derived: total - accepted - rejected would absorb
+    # superseded rows into "pending review", and nobody is reviewing those.
+    pending = await _count(
+        session, Opportunity.status == OpportunityStatus.NEW.value, *window
+    )
     decided = accepted + rejected
     return {
         "total_opportunities": total,
@@ -203,8 +207,14 @@ async def funnel(
     # Opportunities a human actually decided. `notified` only means the
     # reviewer was emailed — on live data 15 notified vs 5 decided, so using
     # notified as the denominator overstates review throughput threefold.
+    # An explicit decision, not merely "no longer new" — superseded is
+    # terminal without a human ever looking at it.
     reviewed = await _count(
-        session, Opportunity.status != OpportunityStatus.NEW.value, *window
+        session,
+        Opportunity.status.in_(
+            (OpportunityStatus.ACCEPTED.value, OpportunityStatus.REJECTED.value)
+        ),
+        *window,
     )
 
     # Contacts found, not sequences created: `run_prospecting` writes a FAILED
@@ -264,7 +274,11 @@ async def score_calibration(
 ) -> dict:
     """Acceptance rate by score band — is the qualification score predictive?"""
     query = select(Opportunity.qualification_score, Opportunity.status).where(
-        Opportunity.status != OpportunityStatus.NEW.value
+        # decided means a human decided — superseded rows carry no decision
+        # and would inflate the denominator of every band they fell into
+        Opportunity.status.in_(
+            (OpportunityStatus.ACCEPTED.value, OpportunityStatus.REJECTED.value)
+        )
     )
     for clause in _window(Opportunity.created_at, start, end):
         query = query.where(clause)

@@ -74,6 +74,7 @@ _STATUS_ORDER = case(
         OpportunityStatus.NEW.value: 0,
         OpportunityStatus.ACCEPTED.value: 1,
         OpportunityStatus.REJECTED.value: 2,
+        OpportunityStatus.SUPERSEDED.value: 3,
     },
     value=Opportunity.status,
     else_=99,
