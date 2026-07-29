@@ -384,6 +384,8 @@ interface Section {
   lead: ExtractedSignal;
   /** Each entry is a group of signals quoting one span. */
   findings: ExtractedSignal[][];
+  /** Deduped across the section's findings, in first-cited order. */
+  sources: SourceRef[];
 }
 
 /**
@@ -414,6 +416,7 @@ function groupSections(rows: ExtractedSignal[][]): Section[] {
         label: row.map((signal) => signal.label).join(" · "),
         lead,
         findings: [row],
+        sources: [],
       });
       continue;
     }
@@ -430,9 +433,25 @@ function groupSections(rows: ExtractedSignal[][]): Section[] {
       label: lead.label,
       lead,
       findings: [row],
+      sources: [],
     };
     byType.set(lead.signal_type, created);
     sections.push(created);
+  }
+
+  // Citations collapse to the section. Findings in one category overwhelmingly
+  // cite the same page — Meta's five trigger events all resolve to a single
+  // investor-relations URL — so rendering them per span printed the same link
+  // five times. Deduped in first-cited order, once, under the findings.
+  for (const section of sections) {
+    const seen = new Set<string>();
+    for (const row of section.findings) {
+      for (const ref of row[0].sources ?? []) {
+        if (seen.has(ref.url)) continue;
+        seen.add(ref.url);
+        section.sources.push(ref);
+      }
+    }
   }
 
   return sections;
@@ -518,10 +537,8 @@ export function ResearchSummary({
                   findings drawn from different citations. */}
               <div className="space-y-3">
                 {section.findings.map((row) => {
-                  // Every member of a row quotes the same span, and sources are
-                  // resolved from that span, so the lead's are the row's.
+                  // Every member of a row quotes the same span.
                   const [lead] = row;
-                  const sources = lead.sources ?? [];
 
                   return (
                     <div key={lead.id}>
@@ -535,23 +552,26 @@ export function ResearchSummary({
                         text={lead.evidence}
                         label={row.length === 1 ? lead.label : undefined}
                       />
-                      {(sources.length > 0 || looksMalformed(lead.evidence)) && (
-                        <div className="text-muted-foreground mt-1 flex items-center gap-1.5 text-[10px]">
-                          <SourceLinks sources={sources} />
-                          {looksMalformed(lead.evidence) && (
-                            <span
-                              className="text-age-overdue shrink-0"
-                              title="The source research contains markup or structured-data fragments. Read this evidence with care."
-                            >
-                              malformed source
-                            </span>
-                          )}
-                        </div>
+                      {looksMalformed(lead.evidence) && (
+                        <span
+                          className="text-age-overdue mt-1 block text-[10px]"
+                          title="The source research contains markup or structured-data fragments. Read this evidence with care."
+                        >
+                          malformed source
+                        </span>
                       )}
                     </div>
                   );
                 })}
               </div>
+
+              {/* Once, under the findings. Repeating a citation beside every
+                  span it backs printed the same host five times for Meta. */}
+              {section.sources.length > 0 && (
+                <div className="mt-2.5">
+                  <SourceLinks sources={section.sources} />
+                </div>
+              )}
             </article>
           ))}
         </div>
