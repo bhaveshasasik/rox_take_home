@@ -125,7 +125,7 @@ export function OpportunityDetailView({ id }: { id: string }) {
           <div className="border-border min-w-0 flex-1 border-r">
             <section className="border-border border-b px-6 py-5">
               <SectionLabel>Rationale</SectionLabel>
-              <p className="text-[13px] leading-[1.65]">{detail.rationale}</p>
+              <Rationale text={detail.rationale} />
             </section>
 
             <ScoreBreakdown
@@ -211,6 +211,38 @@ export function OpportunityDetailView({ id }: { id: string }) {
         }
       />
     </>
+  );
+}
+
+/**
+ * The stored rationale is more than one paragraph: `write_brief` joins the
+ * brief body to its why-now clause with a blank line, and the legacy parser
+ * joins evidence spans the same way. HTML collapses that whitespace, so the
+ * break only survives as real elements — rendering the raw string ran the
+ * timing sentence straight onto the end of the rationale.
+ */
+function Rationale({ text }: { text: string }) {
+  const paragraphs = text
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length === 0) {
+    return (
+      <p className="text-muted-foreground text-[13px] leading-[1.65] italic">
+        No rationale was recorded for this opportunity.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2.5">
+      {paragraphs.map((paragraph, index) => (
+        <p key={index} className="text-[13px] leading-[1.65]">
+          {paragraph}
+        </p>
+      ))}
+    </div>
   );
 }
 
