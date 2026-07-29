@@ -87,8 +87,6 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = ""
     notify_email_to: str = ""
-    #: opportunities queue until this many are pending, then go out as one email
-    notification_batch_size: int = 5
 
     @property
     def email_enabled(self) -> bool:

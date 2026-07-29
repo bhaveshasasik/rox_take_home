@@ -24,7 +24,7 @@ from app.models import (
     Stage,
     utcnow,
 )
-from app.services.notifications import notify_batch
+from app.services.notifications import send_digest
 #: Legacy path. Kept as the fallback for artifacts that have not been
 #: extracted — 357 of 432 at the time of writing — and used for nothing else.
 from app.services.parsing import ParsedCell, parse_cell
@@ -148,9 +148,8 @@ async def create_opportunities_for_run(
     """Parse each account's research artifact from this run and create opportunities.
 
     Notification happens once, after every opportunity in this run is
-    created, rather than per opportunity — the queue batches into one email
-    per `notification_batch_size` instead of flooding the reviewer's inbox
-    with one email per account a single run happens to qualify.
+    created: one digest per producing run, containing everything currently
+    eligible — never one email per account a single run happens to qualify.
     """
     settings = get_settings()
 
@@ -279,6 +278,9 @@ async def create_opportunities_for_run(
     await session.commit()
 
     if notify:
-        await notify_batch(session)
+        # One digest per producing run. Eligibility is the shared query, so
+        # the digest also sweeps qualifying backlog from earlier runs that
+        # never made it into one — and sends nothing when nothing qualifies.
+        await send_digest(session, trigger=run.trigger, run_id=run.id)
 
     return created

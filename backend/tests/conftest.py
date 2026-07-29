@@ -47,12 +47,12 @@ def _no_real_llm_calls():
     of view: `prospecting.build_sequence` calls `draft_emails` for every
     contact on every `run_prospecting()` call; `opportunities.create_opportunities_for_run`
     calls `expand_rationale` for any artifact scoring above
-    `llm_expansion_score_threshold`, and also calls `notify_batch` once after
+    `llm_expansion_score_threshold`, and also calls `send_digest` once after
     every run unless a test asks otherwise. A test that forgets to mock any
     of these would otherwise make a real, billed API call. Individual tests
     can still override these with their own `patch(...)` to test failure
     paths, and tests that want to exercise notification directly call
-    `notifications.notify_opportunity` / `notifications.notify_batch`
+    `notifications.notify_opportunity` / `notifications.send_digest`
     themselves — a different reference than the one patched here, so it's
     unaffected by this fixture.
     """
@@ -62,7 +62,7 @@ def _no_real_llm_calls():
             AsyncMock(return_value=FAKE_DRAFTED_SEQUENCE),
         ),
         patch("app.services.opportunities.expand_rationale", AsyncMock(return_value=None)),
-        patch("app.services.opportunities.notify_batch", AsyncMock(return_value=None)),
+        patch("app.services.opportunities.send_digest", AsyncMock(return_value=None)),
         patch(
             "app.services.notifications.write_notification_summary",
             AsyncMock(return_value=FAKE_NOTIFICATION_SUMMARY),

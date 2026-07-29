@@ -360,8 +360,8 @@ class Notification(Base):
 class Digest(Base):
     """One multi-opportunity email, with its membership recorded.
 
-    The grouping `notify_batch` never had and `send_digest` never wrote: which
-    opportunities a given send actually contained. Membership is what makes
+    The grouping the retired batch path never had and the old digest never
+    wrote: which opportunities a given send actually contained. Membership is what makes
     digest-level dedupe enforceable — "not the same information twice" needs a
     record of what was sent the first time.
     """

@@ -14,3 +14,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# external planning doc — not part of the repo
+checklist.md

@@ -251,16 +251,18 @@ async def retry_notification(
 
 
 def _entry_lines(opportunity: Opportunity, account_name: str, base_url: str) -> list[str]:
-    """The block for one opportunity in a multi-opportunity email.
+    """The block for one opportunity in the digest.
 
-    Account, rationale, review link — never the score, this is a reviewer's
-    inbox, not a leaderboard. Shared by the digest and the batch notification
-    so both list opportunities the same way.
+    Account, primary signal label, score, review link — structured values
+    only. This is the last place generated prose could reach a user, and it
+    does not need to: the label is the scoring driver (stored at creation,
+    kept fresh by rescore), and the score is the number the reviewer will see
+    in the queue. No LLM output appears in a digest.
     """
     return [
         "",
-        account_name,
-        (opportunity.rationale or "").strip(),
+        f"{account_name} — {signal_label(opportunity.signal_type)} — "
+        f"{opportunity.qualification_score}/100",
         f"Review: {base_url}/opportunities/{opportunity.id}",
     ]
 
@@ -312,102 +314,7 @@ async def digest_eligible(session: AsyncSession) -> list[tuple[Opportunity, str]
 
 
 # ----------------------------------------------------------------------
-# Batch — the top N queued opportunities, sent as one email
-# ----------------------------------------------------------------------
-
-
-async def notify_batch(
-    session: AsyncSession, batch_size: int | None = None
-) -> dict:
-    """Once `batch_size` opportunities are queued for review, email the top
-    ones (by score) in a single message instead of one email per opportunity.
-
-    A research run can qualify several accounts at once; notifying per
-    opportunity floods the reviewer's inbox with that many emails back to
-    back. Batching means the send cadence tracks how fast opportunities
-    actually queue up, not the size of any one run — accumulates across runs
-    if a single run doesn't reach the threshold on its own.
-    """
-    settings = get_settings()
-    size = batch_size if batch_size is not None else settings.notification_batch_size
-    base_url = settings.app_base_url.rstrip("/")
-
-    # The shared eligibility query — score floor, undecided, not already a
-    # member of a delivered digest. Not a private variant of it.
-    pending = await digest_eligible(session)
-
-    if len(pending) < size:
-        return {"sent": False, "queued": len(pending)}
-
-    batch = pending[:size]
-
-    to = _configured_recipient()
-    if to is None:
-        log.warning("batch not sent — no email channel configured")
-        return {"sent": False, "queued": len(pending)}
-
-    # Digest + membership before the send, like Notification rows: an SMTP
-    # outage must be visible in the tables, and membership is what stops the
-    # next path from re-sending these opportunities.
-    digest = Digest(
-        channel=Channel.EMAIL.value,
-        recipient=to,
-        trigger="batch",
-        status=NotificationStatus.PENDING.value,
-    )
-    session.add(digest)
-    await session.flush()
-
-    records = []
-    for opp, _account_name in batch:
-        session.add(
-            DigestOpportunity(digest_id=digest.id, opportunity_id=opp.id)
-        )
-        record = Notification(
-            opportunity_id=opp.id,
-            channel=Channel.EMAIL.value,
-            recipient=to,
-            status=NotificationStatus.PENDING.value,
-        )
-        session.add(record)
-        records.append(record)
-    await session.flush()
-
-    lines = [f"{size} new opportunities ready for review", "-" * 33]
-    for opp, account_name in batch:
-        lines.extend(_entry_lines(opp, account_name, base_url))
-    body = "\n".join(lines).rstrip() + "\n"
-    subject = f"[Rox Pipeline] {size} new opportunities to review"
-
-    try:
-        await _send_email(to=to, subject=subject, body=body)
-    except Exception as exc:  # noqa: BLE001 - surface the failure, don't raise
-        digest.status = NotificationStatus.FAILED.value
-        digest.error = str(exc)[:2000]
-        for record in records:
-            record.status = NotificationStatus.FAILED.value
-            record.error = str(exc)[:2000]
-        await session.commit()
-        log.error("batch notification failed", error=str(exc)[:2000])
-        return {"sent": False, "queued": len(pending), "error": str(exc)[:2000]}
-
-    now = utcnow()
-    digest.status = NotificationStatus.SENT.value
-    digest.sent_at = now
-    for record, (opp, _account_name) in zip(records, batch):
-        record.status = NotificationStatus.SENT.value
-        record.sent_at = now
-        opp.notified_at = now
-        if opp.stage == Stage.OPPORTUNITY_CREATED.value:
-            opp.stage = Stage.NOTIFIED.value
-
-    await session.commit()
-    log.info("batch notification sent", count=len(batch), recipient=to)
-    return {"sent": True, "count": len(batch), "recipient": to, "digest_id": digest.id}
-
-
-# ----------------------------------------------------------------------
-# Digest — everything currently awaiting review, in one email
+# Digest — every eligible opportunity, one email per producing run
 # ----------------------------------------------------------------------
 
 
@@ -421,10 +328,22 @@ def build_digest(
     because an empty digest is never sent: no qualifying opportunities means
     no email, not a friendlier email.
     """
+    settings = get_settings()
     lines = ["Today's Opportunities", "-" * 21, ""]
     lines.append(f"{len(rows)} account{'s' if len(rows) != 1 else ''} ready for your review.")
     for opp, account_name in rows:
         lines.extend(_entry_lines(opp, account_name, base_url))
+
+    # The queue itself, pre-filtered to what this digest describes: pending
+    # review at or above the notification floor, strongest first.
+    lines.extend(
+        [
+            "",
+            "Full queue: "
+            f"{base_url}/?status=new&min_score={settings.notification_score_threshold}"
+            "&sort=score&order=desc",
+        ]
+    )
 
     body = "\n".join(lines).rstrip() + "\n"
     subject = f"[Rox Pipeline] {len(rows)} opportunit{'ies' if len(rows) != 1 else 'y'} to review today"
@@ -464,8 +383,21 @@ async def send_digest(
     )
     session.add(digest)
     await session.flush()
+    records: list[Notification] = []
     for opp, _name in eligible:
         session.add(DigestOpportunity(digest_id=digest.id, opportunity_id=opp.id))
+        # One Notification row per included opportunity, like every other
+        # send path — the detail view's timeline and /notifications read
+        # these, and an opportunity notified by digest must not look
+        # un-notified there.
+        record = Notification(
+            opportunity_id=opp.id,
+            channel=Channel.EMAIL.value,
+            recipient=to,
+            status=NotificationStatus.PENDING.value,
+        )
+        session.add(record)
+        records.append(record)
     await session.flush()
 
     subject, body = build_digest(eligible, settings.app_base_url.rstrip("/"))
@@ -475,12 +407,24 @@ async def send_digest(
     except Exception as exc:  # noqa: BLE001 - surface the failure, don't raise
         digest.status = NotificationStatus.FAILED.value
         digest.error = str(exc)[:2000]
+        for record in records:
+            record.status = NotificationStatus.FAILED.value
+            record.error = str(exc)[:2000]
         await session.commit()
         log.error("digest failed", error=str(exc)[:2000])
         return {"sent": False, "count": len(eligible), "error": str(exc)[:2000]}
 
+    now = utcnow()
     digest.status = NotificationStatus.SENT.value
-    digest.sent_at = utcnow()
+    digest.sent_at = now
+    for record, (opp, _name) in zip(records, eligible):
+        record.status = NotificationStatus.SENT.value
+        record.sent_at = now
+        # Decision latency is timed from notified_at; a resend must never
+        # overwrite the first delivery.
+        opp.notified_at = opp.notified_at or now
+        if opp.stage == Stage.OPPORTUNITY_CREATED.value:
+            opp.stage = Stage.NOTIFIED.value
     await session.commit()
     log.info("digest sent", count=len(eligible), recipient=to, digest_id=digest.id)
     return {

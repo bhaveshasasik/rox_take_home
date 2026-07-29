@@ -28,7 +28,7 @@ from app.models import (
 )
 from app.rox.client import RoxClient
 from app.services.decisions import record_decision
-from app.services.notifications import OpportunityMessage, notify_batch, notify_opportunity
+from app.services.notifications import OpportunityMessage, notify_opportunity
 from app.services.prospecting import LocalProspectingProvider, run_prospecting
 from app.services.research import run_research_cycle
 from app.services.research_columns import COLUMN_REFS
@@ -112,96 +112,6 @@ class TestNotifications:
         assert len(resp.json()) == 1
 
 
-class TestBatchNotification:
-    async def test_holds_below_batch_size(self, session, seeded):
-        result = await notify_batch(session, batch_size=5)
-
-        assert result == {"sent": False, "queued": 3}
-        opps = (await session.execute(select(Opportunity))).scalars().all()
-        assert all(o.notified_at is None for o in opps)
-
-    async def test_sends_top_n_by_score_and_leaves_the_rest_queued(self, session, seeded):
-        from unittest.mock import AsyncMock, patch
-
-        opps = (
-            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
-            .scalars()
-            .all()
-        )
-        low, high, mid = opps
-        # all above the notification floor — this test is about ordering and
-        # the queue, not the floor (that has its own tests)
-        low.qualification_score = 85
-        high.qualification_score = 95
-        mid.qualification_score = 90
-        await session.commit()
-
-        with (
-            patch("app.services.notifications._send_email", AsyncMock(return_value=None)),
-            patch(
-                "app.services.notifications._configured_recipient",
-                return_value="reviewer@example.com",
-            ),
-        ):
-            result = await notify_batch(session, batch_size=2)
-
-        assert result["sent"] is True
-        assert result["count"] == 2
-        assert result["recipient"] == "reviewer@example.com"
-        assert result["digest_id"], "the batch send is recorded as a digest"
-
-        for opp in (low, high, mid):
-            await session.refresh(opp)
-        assert high.notified_at is not None
-        assert mid.notified_at is not None
-        assert low.notified_at is None, "lowest score should stay queued below the batch size"
-
-    async def test_email_lists_each_account_without_a_score(self, session, seeded):
-        from unittest.mock import patch
-
-        opps = (await session.execute(select(Opportunity))).scalars().all()
-        sent: dict[str, str] = {}
-
-        async def capture(*, to, subject, body):
-            sent["subject"] = subject
-            sent["body"] = body
-
-        with (
-            patch("app.services.notifications._send_email", capture),
-            patch(
-                "app.services.notifications._configured_recipient",
-                return_value="reviewer@example.com",
-            ),
-        ):
-            result = await notify_batch(session, batch_size=3)
-
-        assert result["sent"] is True
-        assert "3 new opportunities" in sent["subject"]
-        assert "score" not in sent["body"].lower()
-        for opp in opps:
-            assert f"{opp.qualification_score}/100" not in sent["body"]
-            assert f"/opportunities/{opp.id}" in sent["body"]
-
-    async def test_creates_a_notification_record_per_opportunity_in_the_batch(
-        self, session, seeded, client
-    ):
-        from unittest.mock import AsyncMock, patch
-
-        with (
-            patch("app.services.notifications._send_email", AsyncMock(return_value=None)),
-            patch(
-                "app.services.notifications._configured_recipient",
-                return_value="reviewer@example.com",
-            ),
-        ):
-            await notify_batch(session, batch_size=3)
-
-        resp = await client.get("/notifications")
-        assert resp.status_code == 200
-        assert len(resp.json()) == 3
-        assert all(n["status"] == "sent" for n in resp.json())
-
-
 class TestDigest:
     def _delivery(self):
         """Patched SMTP + recipient, capturing every send."""
@@ -249,17 +159,67 @@ class TestDigest:
         assert result["count"] == 2
         assert f"/opportunities/{opps[0].id}" not in sent[0]["body"]
 
-    async def test_omits_the_score(self, session, seeded):
+    async def test_entries_are_structured_values_sorted_by_score(self, session, seeded):
+        """Account, driver label, score, link — and nothing generated. Phase 5
+        deliberately includes the score the reviewer will see in the queue."""
         from app.services.notifications import send_digest
 
-        opps = (await session.execute(select(Opportunity))).scalars().all()
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        opps[0].qualification_score = 95
+        opps[1].qualification_score = 85
+        opps[2].qualification_score = 90
+        await session.commit()
+
         sent, patches = self._delivery()
         with patches[0], patches[1]:
             await send_digest(session)
 
+        body = sent[0]["body"]
         for opp in opps:
-            assert f"{opp.qualification_score}/100" not in sent[0]["body"]
-        assert "score" not in sent[0]["body"].lower()
+            await session.refresh(opp)
+            assert f"{opp.qualification_score}/100" in body
+        # strongest first: 95 renders above 90 renders above 85
+        assert body.index("95/100") < body.index("90/100") < body.index("85/100")
+        # the driver's display label, never the raw slug
+        assert "Trigger Event" in body
+        assert "trigger_event" not in body
+        # no generated prose: the rationale stays out of the digest
+        for opp in opps:
+            first_line = (opp.rationale or "").splitlines()[0].strip()
+            if first_line:
+                assert first_line not in body
+
+    async def test_footer_links_the_filtered_queue(self, session, seeded):
+        from app.services.notifications import send_digest
+
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            await send_digest(session)
+
+        assert "Full queue: http://localhost:3000/?status=new&min_score=80" in sent[0]["body"]
+
+    async def test_send_sets_notified_at_and_writes_notification_rows(
+        self, session, seeded
+    ):
+        """Decision latency is timed from notified_at, and the detail view's
+        timeline reads Notification rows — a digest send must feed both."""
+        from app.models import Notification
+        from app.services.notifications import send_digest
+
+        sent, patches = self._delivery()
+        with patches[0], patches[1]:
+            await send_digest(session)
+
+        opps = (await session.execute(select(Opportunity))).scalars().all()
+        assert all(o.notified_at is not None for o in opps)
+        assert all(o.stage == Stage.NOTIFIED.value for o in opps)
+        records = (await session.execute(select(Notification))).scalars().all()
+        assert len(records) == 3
+        assert all(r.status == "sent" for r in records)
 
     async def test_link_is_the_last_line_of_each_entry(self, session, seeded):
         from app.services.notifications import send_digest
@@ -269,7 +229,8 @@ class TestDigest:
             await send_digest(session)
 
         blocks = [b for b in sent[0]["body"].split("\n\n") if b.strip()]
-        for block in blocks[2:]:  # skip the title block and the summary line
+        assert blocks[-1].strip().startswith("Full queue: http")
+        for block in blocks[2:-1]:  # between the header blocks and the footer
             assert block.strip().splitlines()[-1].startswith("Review: http")
 
     async def test_nothing_eligible_sends_nothing(self, session):
@@ -321,27 +282,6 @@ class TestDigest:
 
         assert result["sent"] is False and "smtp down" in result["error"]
         assert len(await digest_eligible(session)) == 3
-
-    async def test_batch_records_membership_too(self, session, seeded):
-        """notify_batch is a send path like any other — what it sends is
-        consumed, and a digest after it finds nothing left."""
-        from unittest.mock import AsyncMock, patch
-
-        from app.models import DigestOpportunity
-        from app.services.notifications import digest_eligible
-
-        with patch(
-            "app.services.notifications._send_email", AsyncMock(return_value=None)
-        ), patch(
-            "app.services.notifications._configured_recipient",
-            return_value="reviewer@example.com",
-        ):
-            result = await notify_batch(session, batch_size=3)
-
-        assert result["sent"] is True
-        members = (await session.execute(select(DigestOpportunity))).scalars().all()
-        assert len(members) == 3
-        assert await digest_eligible(session) == []
 
     async def test_decided_is_not_eligible(self, session, seeded, client):
         from app.services.notifications import digest_eligible

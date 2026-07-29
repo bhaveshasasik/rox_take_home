@@ -211,6 +211,60 @@ class TestResearchCycle:
         assert run.error is None
         assert run.overrides is None, "an unforced run records no overrides"
 
+    async def test_run_fires_one_digest_with_its_run_id(self, session):
+        """Phase 5: one digest per producing run, stamped with the run that
+        produced it. The conftest stub is swapped for the real send path."""
+        from app.models import Digest
+        from app.services.notifications import send_digest as real_send_digest
+
+        sent = []
+
+        async def capture(*, to, subject, body):
+            sent.append(subject)
+
+        with (
+            mock_rox(),
+            patch("app.services.opportunities.send_digest", real_send_digest),
+            patch("app.services.notifications._send_email", capture),
+            patch(
+                "app.services.notifications._configured_recipient",
+                return_value="reviewer@example.com",
+            ),
+        ):
+            async with client() as rox:
+                run = await run_research_cycle(session, rox, trigger="manual")
+
+        digests = (await session.execute(select(Digest))).scalars().all()
+        assert len(sent) == 1 and len(digests) == 1
+        assert digests[0].run_id == run.id
+        assert digests[0].trigger == "manual"
+        assert digests[0].status == "sent"
+
+    async def test_run_with_nothing_qualifying_sends_no_digest(self, session):
+        """No qualifying opportunities, no digest — no row, no email."""
+        from app.models import Digest
+        from app.services.notifications import send_digest as real_send_digest
+
+        sent = []
+
+        async def capture(*, to, subject, body):
+            sent.append(subject)
+
+        with (
+            mock_rox(default_opp=WEAK_OPP),
+            patch("app.services.opportunities.send_digest", real_send_digest),
+            patch("app.services.notifications._send_email", capture),
+            patch(
+                "app.services.notifications._configured_recipient",
+                return_value="reviewer@example.com",
+            ),
+        ):
+            async with client() as rox:
+                await run_research_cycle(session, rox, trigger="manual")
+
+        assert sent == []
+        assert (await session.execute(select(Digest))).scalars().all() == []
+
     async def test_forced_run_records_its_overrides(self, session):
         with mock_rox():
             async with client() as rox:
