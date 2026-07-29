@@ -37,7 +37,12 @@ export function isAging(iso: string, now: number = Date.now()): boolean {
   return hoursSince(iso, now) >= AGING_THRESHOLD_HOURS;
 }
 
-export type PipelineStatus = "Pending" | "Accepted" | "Rejected" | "Prospecting";
+export type PipelineStatus =
+  | "Pending"
+  | "Accepted"
+  | "Rejected"
+  | "Prospecting"
+  | "Superseded";
 
 /** Stages that mean prospecting has started, whatever `status` still says. */
 const PROSPECTING_STAGES: ReadonlySet<Schemas["Stage"]> = new Set([
@@ -58,6 +63,9 @@ export function pipelineStatus(
   if (PROSPECTING_STAGES.has(stage)) return "Prospecting";
   if (status === "accepted") return "Accepted";
   if (status === "rejected") return "Rejected";
+  // Terminal without a decision — must never fall through to "Pending",
+  // which would put a closed row back in the triage queue's clothing.
+  if (status === "superseded") return "Superseded";
   return "Pending";
 }
 

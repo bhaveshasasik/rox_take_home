@@ -12,7 +12,12 @@ import {
  * drift out of sync, and browser history navigation works for free.
  */
 
-const STATUSES: readonly Schemas["OpportunityStatus"][] = ["new", "accepted", "rejected"];
+const STATUSES: readonly Schemas["OpportunityStatus"][] = [
+  "new",
+  "accepted",
+  "rejected",
+  "superseded",
+];
 
 function isStatus(value: string): value is Schemas["OpportunityStatus"] {
   return (STATUSES as readonly string[]).includes(value);

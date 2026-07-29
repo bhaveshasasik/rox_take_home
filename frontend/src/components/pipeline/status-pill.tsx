@@ -7,13 +7,17 @@ import { cn } from "@/lib/utils";
  * be added — and every entry points at a theme token so pills follow
  * light/dark without edits.
  */
-export type PillTone = "neutral" | "positive" | "negative" | "info";
+export type PillTone = "neutral" | "positive" | "negative" | "info" | "muted";
 
 const TONE_STYLES: Record<PillTone, string> = {
   neutral: "bg-status-pending text-status-pending-fg",
   positive: "bg-status-accepted text-status-accepted-fg",
   negative: "bg-status-rejected text-status-rejected-fg",
   info: "bg-status-prospecting text-status-prospecting-fg",
+  // For rows closed without anyone acting — superseded. An absence of a
+  // decision, not a decision, so it gets the muted tokens rather than a
+  // colour that would read as one.
+  muted: "bg-muted text-muted-foreground",
 };
 
 /** Base pill. Use this for any status vocabulary other than the pipeline's. */
@@ -45,6 +49,7 @@ const PIPELINE_TONES: Record<PipelineStatus, PillTone> = {
   Accepted: "positive",
   Rejected: "negative",
   Prospecting: "info",
+  Superseded: "muted",
 };
 
 export function StatusPill({

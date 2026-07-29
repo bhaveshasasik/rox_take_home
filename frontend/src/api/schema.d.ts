@@ -785,6 +785,11 @@ export interface components {
              * @default false
              */
             contested: boolean;
+            /**
+             * Validation Failed
+             * @default false
+             */
+            validation_failed: boolean;
             /** Rationale */
             rationale: string;
             /** Evidence */
@@ -1041,7 +1046,7 @@ export interface components {
          * OpportunityStatus
          * @enum {string}
          */
-        OpportunityStatus: "new" | "accepted" | "rejected";
+        OpportunityStatus: "new" | "accepted" | "rejected" | "superseded";
         /** OutreachEmailOut */
         OutreachEmailOut: {
             /** Id */
