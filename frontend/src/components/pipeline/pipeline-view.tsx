@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo } from "react";
 
@@ -74,28 +75,38 @@ export function PipelineView() {
 
   return (
     <div className="flex min-h-full flex-col">
-      <header className="border-border bg-card border-b px-6 py-4">
-        <h1 className="text-[15px] leading-none font-semibold">Pipeline</h1>
-        <p className="text-muted-foreground mt-1 text-[12px] leading-none">
-          {stats.isPending ? (
-            "Loading…"
-          ) : stats.isError ? (
-            // the list has its own error state; don't repeat the failure here
-            "—"
-          ) : (
-            <>
-              {stats.data.pending} pending review
-              {stats.data.aging > 0 && (
-                <>
-                  <span className="text-border mx-1.5">·</span>
-                  <span className="text-age-overdue font-medium">
-                    {stats.data.aging} aging past {stats.data.aging_threshold_hours}h
-                  </span>
-                </>
-              )}
-            </>
-          )}
-        </p>
+      <header className="border-border bg-card flex flex-wrap items-center justify-between gap-3 border-b px-6 py-4">
+        <div>
+          <h1 className="text-[15px] leading-none font-semibold">Pipeline</h1>
+          <p className="text-muted-foreground mt-1 text-[12px] leading-none">
+            {stats.isPending ? (
+              "Loading…"
+            ) : stats.isError ? (
+              // the list has its own error state; don't repeat the failure here
+              "—"
+            ) : (
+              <>
+                {stats.data.pending} pending review
+                {stats.data.aging > 0 && (
+                  <>
+                    <span className="text-border mx-1.5">·</span>
+                    <span className="text-age-overdue font-medium">
+                      {stats.data.aging} aging past {stats.data.aging_threshold_hours}h
+                    </span>
+                  </>
+                )}
+              </>
+            )}
+          </p>
+        </div>
+        {/* Counterpart of the reporting header's "Pipeline" link — without it
+            /reporting is reachable only by typing the URL. */}
+        <Link
+          href="/reporting"
+          className="border-border bg-card hover:bg-accent focus-visible:ring-ring rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors focus-visible:ring-1 focus-visible:outline-none"
+        >
+          Reporting
+        </Link>
       </header>
 
       <FilterBar filters={filters} signalOptions={signalOptions} onChange={update} />

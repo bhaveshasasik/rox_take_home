@@ -189,7 +189,7 @@ function MoreToggle({
  * substituting it here would present an unverifiable sentence in the place a
  * reader expects quoted source text, which is worse than an empty slot.
  */
-function Evidence({ text, label }: { text: string; label: string }) {
+function Evidence({ text, label }: { text: string; label?: string }) {
   const body = readable(text ?? "", label);
   if (!body) {
     return (
@@ -320,6 +320,144 @@ function readable(text: string, label?: string) {
 }
 
 /**
+ * Signals quoting a byte-identical span, collapsed into one row.
+ *
+ * Two shapes produce this, and both render as the same sentence repeated:
+ *
+ * - Absences. One "nothing was found" statement legitimately becomes one
+ *   absence per category — the extraction prompt says so explicitly, and the
+ *   stored signals must keep their types because scoring counts them
+ *   separately. Cisco printed six identical blocks.
+ * - Positives. Here a shared span is a defect, not a design: the prompt tells
+ *   the model not to split one finding across two entries. Meta emitted one
+ *   headcount sentence as both `trigger_event` and `other`; Abbott emitted one
+ *   sentence across three scoring categories.
+ *
+ * They are grouped the same way because the reader's problem is identical, and
+ * because the alternative — showing a duplicate to signal that a duplicate
+ * exists — helps nobody. The underlying extraction defect is a scoring
+ * concern and is tracked separately; nothing here hides it, since every
+ * category the span was filed under is still named on the row.
+ *
+ * Grouping is display-only: every signal still arrives, still scores, and is
+ * still reachable. Only the row count drops.
+ *
+ * `is_absence` and `contested` are part of the key, never merged across. A
+ * contested signal is one the model called positive over absence-shaped
+ * evidence, so folding it in beside an undisputed finding would assert the
+ * very thing the flag disputes.
+ */
+function groupRows(signals: ExtractedSignal[]): ExtractedSignal[][] {
+  const rows: ExtractedSignal[][] = [];
+  const byKey = new Map<string, ExtractedSignal[]>();
+
+  for (const signal of signals) {
+    const span = (signal.evidence ?? "").trim();
+    // An empty span carries nothing to group on — two signals whose evidence
+    // failed validation are not thereby the same finding.
+    if (!span) {
+      rows.push([signal]);
+      continue;
+    }
+
+    const key = `${signal.is_absence ? 1 : 0}|${signal.contested ? 1 : 0}|${span}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.push(signal);
+      continue;
+    }
+    // Pushed and indexed as the same array, so later members land in the row
+    // already holding this span's position in the ranking.
+    const created = [signal];
+    byKey.set(key, created);
+    rows.push(created);
+  }
+
+  return rows;
+}
+
+/** One rendered block: a category heading over the findings filed under it. */
+interface Section {
+  key: string;
+  label: string;
+  /** Carries the badge state — every finding in a section shares it. */
+  lead: ExtractedSignal;
+  /** Each entry is a group of signals quoting one span. */
+  findings: ExtractedSignal[][];
+  /** Deduped across the section's findings, in first-cited order. */
+  sources: SourceRef[];
+}
+
+/**
+ * Findings collapsed into one block per category.
+ *
+ * A row was previously one signal, so an account with several distinct
+ * findings in the same category printed the heading once per finding — Meta
+ * showed four separate "Growth / Expansion" blocks and five "Trigger Event"
+ * ones. The findings are genuinely different (revenue, product usage, ads
+ * run-rate, compute scaling), so they cannot be deduplicated; they just belong
+ * under one heading rather than repeating it.
+ *
+ * Absences and contested findings stay whole. Both already carry a
+ * multi-category label — one span filed under several categories at once —
+ * so bucketing them by a single type would either split a row that is
+ * deliberately one thing, or file it under an arbitrary member of its list.
+ */
+function groupSections(rows: ExtractedSignal[][]): Section[] {
+  const sections: Section[] = [];
+  const byType = new Map<string, Section>();
+
+  for (const row of rows) {
+    const [lead] = row;
+
+    if (lead.is_absence || lead.contested) {
+      sections.push({
+        key: lead.id,
+        label: row.map((signal) => signal.label).join(" · "),
+        lead,
+        findings: [row],
+        sources: [],
+      });
+      continue;
+    }
+
+    const existing = byType.get(lead.signal_type);
+    if (existing) {
+      existing.findings.push(row);
+      continue;
+    }
+    // `lead.label` is this type's own label — not the row's joined one, which
+    // would name a second category the rest of the section does not share.
+    const created: Section = {
+      key: lead.signal_type,
+      label: lead.label,
+      lead,
+      findings: [row],
+      sources: [],
+    };
+    byType.set(lead.signal_type, created);
+    sections.push(created);
+  }
+
+  // Citations collapse to the section. Findings in one category overwhelmingly
+  // cite the same page — Meta's five trigger events all resolve to a single
+  // investor-relations URL — so rendering them per span printed the same link
+  // five times. Deduped in first-cited order, once, under the findings.
+  for (const section of sections) {
+    const seen = new Set<string>();
+    for (const row of section.findings) {
+      for (const ref of row[0].sources ?? []) {
+        if (seen.has(ref.url)) continue;
+        seen.add(ref.url);
+        section.sources.push(ref);
+      }
+    }
+  }
+
+  return sections;
+}
+
+/**
  * Extracted signals as labelled sections, each with the citations backing it.
  *
  * Falls back to the artifact's parsed signals, then to its narrative prose, for
@@ -337,59 +475,111 @@ export function ResearchSummary({
   if (extractedSignals.length > 0) {
     const fetchedAt = (research ?? [])[0]?.fetched_at;
     const columnName = (research ?? [])[0]?.column_name;
-    const shown = expanded ? extractedSignals : extractedSignals.slice(0, RESEARCH_PREVIEW);
+    // `other` is the dismissed bucket — firmographics and reporting cadence —
+    // and scores nothing by definition. Left in server rank it fills the whole
+    // preview: Cisco's top three were a headquarters address, a website and an
+    // industry description, with every real finding behind the toggle.
+    //
+    // Deranked here rather than filtered: this section is the one place that
+    // lists every finding, and the rail beside it already drops `other`.
+    // A stable sort on that single key leaves the server's ranking — absence,
+    // then confidence, then emitted position — intact underneath, so display
+    // order stays a strict refinement of the order scoring and the brief read.
+    // Copied first because the array belongs to the query cache.
+    const ranked = [...extractedSignals].sort(
+      (a, b) => Number(a.signal_type === "other") - Number(b.signal_type === "other"),
+    );
+    const sections = groupSections(groupRows(ranked));
+    const shown = expanded ? sections : sections.slice(0, RESEARCH_PREVIEW);
 
     return (
       <section className="px-6 py-5">
         <SectionLabel>Research summary</SectionLabel>
         <div className="space-y-5">
-          {shown.map((signal) => (
-            <article key={signal.id} className="border-border border-b pb-5 last:border-0 last:pb-0">
+          {shown.map((section) => (
+            <article
+              key={section.key}
+              className="border-border border-b pb-5 last:border-0 last:pb-0"
+            >
               <div className="mb-1.5 flex items-center justify-between gap-3">
                 <span className="flex min-w-0 items-center gap-1.5">
-                  <span className="truncate text-[12px] font-medium">{signal.label}</span>
-                  {signal.is_absence && (
+                  {/* Six categories over one span outruns the column, so the
+                      full list stays reachable on hover. */}
+                  <span className="truncate text-[12px] font-medium" title={section.label}>
+                    {section.label}
+                  </span>
+                  {section.findings.length > 1 && (
+                    <span className="text-muted-foreground shrink-0 text-[10px]">
+                      {section.findings.length} findings
+                    </span>
+                  )}
+                  {section.lead.is_absence && (
                     <span className="text-muted-foreground shrink-0 text-[10px]">
                       nothing found
                     </span>
                   )}
-                  {signal.contested && (
+                  {section.lead.contested && (
                     <span className="text-age-overdue shrink-0 text-[10px]">disputed</span>
                   )}
-                  {looksMalformed(signal.evidence) && (
-                    <span
-                      className="text-age-overdue shrink-0 text-[10px]"
-                      title="The source research contains markup or structured-data fragments. Read this evidence with care."
-                    >
-                      malformed source
-                    </span>
-                  )}
                 </span>
-                <div className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[10px]">
-                  <SourceLinks sources={signal.sources ?? []} />
-                  {fetchedAt && (
-                    <>
-                      {(signal.sources ?? []).some((s) => s.kind === "web") && (
-                        <span className="text-border">·</span>
-                      )}
-                      <span className="font-mono" title={absoluteTime(fetchedAt)}>
-                        {formatAge(fetchedAt)} ago
-                      </span>
-                    </>
-                  )}
-                </div>
+                {fetchedAt && (
+                  <span
+                    className="text-muted-foreground shrink-0 font-mono text-[10px]"
+                    title={absoluteTime(fetchedAt)}
+                  >
+                    {formatAge(fetchedAt)} ago
+                  </span>
+                )}
               </div>
-              {/* The verbatim span only. The per-signal rationale is generated
-                  prose and cannot be checked against the source, so it is not
-                  shown here — evidence can be, and is. */}
-              <Evidence text={signal.evidence} label={signal.label} />
+
+              {/* One entry per finding. Sources sit with the span they back
+                  rather than on the heading — a category can hold several
+                  findings drawn from different citations. */}
+              <div className="space-y-3">
+                {section.findings.map((row) => {
+                  // Every member of a row quotes the same span.
+                  const [lead] = row;
+
+                  return (
+                    <div key={lead.id}>
+                      {/* The verbatim span only. The per-signal rationale is
+                          generated prose and cannot be checked against the
+                          source, so it is not shown — evidence can be, and is. */}
+                      {/* A grouped row passes no label: `readable` strips a
+                          leading category prefix, and only the lead's would
+                          ever match. */}
+                      <Evidence
+                        text={lead.evidence}
+                        label={row.length === 1 ? lead.label : undefined}
+                      />
+                      {looksMalformed(lead.evidence) && (
+                        <span
+                          className="text-age-overdue mt-1 block text-[10px]"
+                          title="The source research contains markup or structured-data fragments. Read this evidence with care."
+                        >
+                          malformed source
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Once, under the findings. Repeating a citation beside every
+                  span it backs printed the same host five times for Meta. */}
+              {section.sources.length > 0 && (
+                <div className="mt-2.5">
+                  <SourceLinks sources={section.sources} />
+                </div>
+              )}
             </article>
           ))}
         </div>
         <MoreToggle
-          hidden={extractedSignals.length - shown.length}
+          hidden={sections.length - shown.length}
           expanded={expanded}
           onToggle={() => setExpanded((v) => !v)}
+          noun="category"
         />
         {columnName && (
           <p className="text-muted-foreground/70 mt-4 text-[10px]">Source: {columnName}</p>
