@@ -51,7 +51,7 @@ async def should_skip_account(
     account_id: str,
     signal_type: str | None = None,
     *,
-    new_score: int | None = None,
+    new_score: int | None,
 ) -> str | None:
     """Return a reason to skip this account, or None to proceed.
 
@@ -71,6 +71,16 @@ async def should_skip_account(
          than re-asking every cycle.
     """
     settings = get_settings()
+
+    # Required, not defaulted: a caller that forgets the score silently
+    # falls back to unconditional blocking, which regenerates the exact
+    # deadlock the score-aware guard exists to fix. Passing None is allowed
+    # but must be a visible, deliberate choice.
+    if new_score is None:
+        log.warning(
+            "dedupe without a score — open opportunities block unconditionally",
+            account_id=account_id,
+        )
 
     open_existing = (
         await session.execute(

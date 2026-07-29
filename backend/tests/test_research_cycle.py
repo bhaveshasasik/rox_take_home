@@ -437,7 +437,7 @@ class TestDedupe:
 
     async def test_open_opportunity_blocks(self, session):
         account, _ = await self._seed(session, status=OpportunityStatus.NEW.value)
-        reason = await should_skip_account(session, account.id)
+        reason = await should_skip_account(session, account.id, new_score=None)
         assert reason and "pending review" in reason
 
     async def test_open_opportunity_blocks_scores_inside_the_margin(self, session):
@@ -479,13 +479,15 @@ class TestDedupe:
         account, _ = await self._seed(
             session, status=OpportunityStatus.SUPERSEDED.value
         )
-        assert await should_skip_account(session, account.id) is None
+        assert await should_skip_account(session, account.id, new_score=None) is None
 
     async def test_dedupe_is_per_account_not_per_signal(self, session):
         """signal_type is derived from the cell's own label and can drift between
         runs, so a different label must not let a duplicate through."""
         account, _ = await self._seed(session, status=OpportunityStatus.NEW.value)
-        assert await should_skip_account(session, account.id, "leadership_change")
+        assert await should_skip_account(
+            session, account.id, "leadership_change", new_score=None
+        )
 
     async def test_recent_decision_in_cooldown(self, session):
         from datetime import timedelta
@@ -495,7 +497,7 @@ class TestDedupe:
             status=OpportunityStatus.REJECTED.value,
             decided_at=(utcnow() - timedelta(days=1)).replace(tzinfo=None),
         )
-        reason = await should_skip_account(session, account.id)
+        reason = await should_skip_account(session, account.id, new_score=None)
         assert reason and "cooldown" in reason
 
     async def test_old_decision_allows_resurfacing(self, session):
@@ -506,7 +508,7 @@ class TestDedupe:
             status=OpportunityStatus.REJECTED.value,
             decided_at=(utcnow() - timedelta(days=30)).replace(tzinfo=None),
         )
-        assert await should_skip_account(session, account.id) is None
+        assert await should_skip_account(session, account.id, new_score=None) is None
 
     async def test_repeat_runs_do_not_duplicate(self, session):
         with mock_rox():

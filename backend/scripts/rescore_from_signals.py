@@ -17,9 +17,11 @@ Deliberate choices:
   They keep their original score and will still disagree with their breakdown —
   a smaller, older residue than rewriting history. `--include-decided` overrides
   this, which you want only if the original decisions are being discarded too.
-* **`needs_review` moves with the score**, because both come out of the same
-  composition — leaving a stale flag beside a fresh score is the inconsistency
-  this script exists to remove.
+* **`needs_review` and `signal_type` move with the score**, because all three
+  come out of the same scoring pass — leaving a stale flag or a stale label
+  beside a fresh score is the inconsistency this script exists to remove.
+  `signal_type` only ever moves to a real driver: a pass that found nothing
+  scoreable has no driver, and the stored label stands.
 * **Nothing is deleted.** An opportunity rescored below
   `OPPORTUNITY_SCORE_THRESHOLD` still exists; the threshold gates creation, not
   continued existence. Those rows are reported so the drop is not silent.
@@ -83,7 +85,18 @@ async def rescore(*, dry_run: bool, include_decided: bool) -> None:
 
             scored, _signals = got
             before = opportunity.qualification_score
-            if scored.score == before and scored.needs_review == opportunity.needs_review:
+
+            # The driver, when one exists. None means nothing scoreable — a
+            # real answer about the account, not a label to overwrite with;
+            # the stored value (usually "other") stands.
+            driver = scored.signal_type.value if scored.signal_type else None
+            type_stale = driver is not None and driver != opportunity.signal_type
+
+            if (
+                scored.score == before
+                and scored.needs_review == opportunity.needs_review
+                and not type_stale
+            ):
                 unchanged += 1
                 continue
 
@@ -91,6 +104,8 @@ async def rescore(*, dry_run: bool, include_decided: bool) -> None:
             if before >= threshold > scored.score:
                 dropped_below.append((account_name, before, scored.score))
                 note = f"now below the {threshold} threshold"
+            if type_stale:
+                note = f"{note}  {opportunity.signal_type} -> {driver}".strip()
 
             changed += 1
             print(f"{account_name[:24]:<24} {before:>5} {scored.score:>5}  {note}")
@@ -98,6 +113,11 @@ async def rescore(*, dry_run: bool, include_decided: bool) -> None:
             if not dry_run:
                 opportunity.qualification_score = scored.score
                 opportunity.needs_review = scored.needs_review
+                # signal_type moves with the score: both come out of the same
+                # scoring pass, and a fresh score beside a stale label is the
+                # inconsistency this script exists to remove.
+                if type_stale:
+                    opportunity.signal_type = driver
 
         if not dry_run:
             await session.commit()
