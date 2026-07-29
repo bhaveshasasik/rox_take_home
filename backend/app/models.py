@@ -23,6 +23,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 from app.db import Base
 
@@ -33,6 +34,38 @@ def _uuid() -> str:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class UtcDateTime(TypeDecorator):
+    """Stores naive UTC, hands back timezone-aware UTC.
+
+    SQLite has no timezone-aware type. Plain `DateTime` silently drops tzinfo
+    on write and returns a naive value on read, which FastAPI then serialises
+    with no offset at all — `2026-07-28T06:26:29.486897`. Every JavaScript
+    client parses an offset-less datetime as *local* time, so a browser at
+    UTC-7 reads that as 13:26 UTC and every rendered age is off by the
+    viewer's offset. It looks correct in UTC, which is how it survives review.
+
+    Storage format is unchanged (naive UTC), so rows written before this type
+    existed are read back correctly and no migration is needed.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            # Naive input is taken as UTC — that is what every writer here means
+            # and what rows predating this type contain.
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect) -> datetime | None:
+        if value is None:
+            return None
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 # --------------------------------------------------------------------------
@@ -126,7 +159,7 @@ class Account(Base):
     industry: Mapped[str | None] = mapped_column(String(128), nullable=True)
     parent_rox_entity_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    synced_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    synced_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     opportunities: Mapped[list[Opportunity]] = relationship(back_populates="account")
 
@@ -146,8 +179,8 @@ class ResearchColumn(Base):
     rox_column_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     rox_section_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
 
 class ResearchRun(Base):
@@ -156,8 +189,8 @@ class ResearchRun(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     trigger: Mapped[str] = mapped_column(String(32), default="scheduled")
     status: Mapped[str] = mapped_column(String(32), default=RunStatus.RUNNING.value)
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     accounts_scanned: Mapped[int] = mapped_column(Integer, default=0)
     columns_refreshed: Mapped[int] = mapped_column(Integer, default=0)
     jobs_enqueued: Mapped[int] = mapped_column(Integer, default=0)
@@ -192,7 +225,7 @@ class ResearchArtifact(Base):
     column_id: Mapped[str] = mapped_column(ForeignKey("research_columns.id"))
     cell_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    fetched_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     run: Mapped[ResearchRun] = relationship(back_populates="artifacts")
     account: Mapped[Account] = relationship()
@@ -246,9 +279,9 @@ class Opportunity(Base):
     )
     assigned_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
-    notified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, index=True)
+    notified_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     account: Mapped[Account] = relationship(back_populates="opportunities")
     research_links: Mapped[list[OpportunityResearchLink]] = relationship(
@@ -277,7 +310,7 @@ class Decision(Base):
     decided_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     reason_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    decided_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    decided_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     #: notified_at -> decided_at, powers the time-to-decision report
     latency_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
@@ -299,8 +332,8 @@ class Notification(Base):
     payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
 
     opportunity: Mapped[Opportunity] = relationship(back_populates="notifications")
 
@@ -328,7 +361,7 @@ class Contact(Base):
     match_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     opportunity: Mapped[Opportunity] = relationship(back_populates="contacts")
     account: Mapped[Account] = relationship()
@@ -347,7 +380,7 @@ class Sequence(Base):
         String(32), default=SequenceStatus.DRAFT.value, index=True
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     opportunity: Mapped[Opportunity] = relationship(back_populates="sequence")
     enrollments: Mapped[list[SequenceEnrollment]] = relationship(
@@ -368,7 +401,7 @@ class SequenceEnrollment(Base):
     status: Mapped[str] = mapped_column(
         String(32), default=EnrollmentStatus.PENDING.value, index=True
     )
-    enrolled_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    enrolled_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     sequence: Mapped[Sequence] = relationship(back_populates="enrollments")
     contact: Mapped[Contact] = relationship()
@@ -390,8 +423,8 @@ class OutreachEmail(Base):
     status: Mapped[str] = mapped_column(
         String(32), default=EmailStatus.DRAFT.value, index=True
     )
-    send_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    send_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     enrollment: Mapped[SequenceEnrollment] = relationship(back_populates="emails")

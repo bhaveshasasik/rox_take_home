@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -14,28 +16,71 @@ from app.models import (
     DecisionType,
     Opportunity,
     OpportunityResearchLink,
+    OpportunityStatus,
     ResearchArtifact,
     Sequence,
+    Stage,
+    utcnow,
 )
 from app.schemas import (
     DecisionIn,
+    DecisionOut,
+    NotificationOut,
     OpportunityDetailOut,
     OpportunityListOut,
     OpportunityOut,
+    PipelineStatsOut,
     ResearchArtifactOut,
+    ResearchSignalOut,
 )
 from app.services.decisions import AlreadyDecidedError, record_decision
 from app.services.notifications import signal_label
+from app.services.parsing import parse_cell, parse_signals
 from app.services.prospecting import run_prospecting
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/opportunities", tags=["opportunities"])
+
+#: Pipeline order, not alphabetical. Sorting `stage` as text yields
+#: "accepted, notified, opportunity_created, ..." which tells a reviewer
+#: nothing; these ordinals sort it the way the funnel actually runs.
+#: `rejected` is terminal and off the acceptance path, so it sorts last.
+_STAGE_ORDER = case(
+    {
+        Stage.RESEARCHED.value: 0,
+        Stage.OPPORTUNITY_CREATED.value: 1,
+        Stage.NOTIFIED.value: 2,
+        Stage.ACCEPTED.value: 3,
+        Stage.PROSPECTED.value: 4,
+        Stage.SEQUENCED.value: 5,
+        Stage.OUTREACH_SENT.value: 6,
+        Stage.REJECTED.value: 7,
+    },
+    value=Opportunity.stage,
+    else_=99,
+)
+
+#: Undecided first — the queue's whole job is surfacing what still needs action.
+_STATUS_ORDER = case(
+    {
+        OpportunityStatus.NEW.value: 0,
+        OpportunityStatus.ACCEPTED.value: 1,
+        OpportunityStatus.REJECTED.value: 2,
+    },
+    value=Opportunity.status,
+    else_=99,
+)
 
 SORT_FIELDS = {
     "created_at": Opportunity.created_at,
     "score": Opportunity.qualification_score,
     "decided_at": Opportunity.decided_at,
     "account": Account.name,
+    "stage": _STAGE_ORDER,
+    "status": _STATUS_ORDER,
+    # no meaningful domain order — alphabetical matches the displayed label,
+    # which is a title-cased rendering of this value
+    "signal_type": Opportunity.signal_type,
 }
 
 
@@ -99,6 +144,42 @@ async def list_opportunities(
     )
 
 
+# Must stay ahead of `/{opportunity_id}`: FastAPI matches in declaration order,
+# and the parameterised route would otherwise swallow "stats" as an id.
+@router.get("/stats", response_model=PipelineStatsOut)
+async def get_stats(
+    session: AsyncSession = Depends(get_session),
+    aging_hours: int = Query(
+        48, ge=1, le=8760, description="age past which a pending opportunity is stale"
+    ),
+) -> PipelineStatsOut:
+    """Counts for the pipeline header — how much is waiting, and how much has gone stale.
+
+    Kept out of the list response because it is a property of the queue rather
+    than of the current page, and computed here rather than in the browser: it
+    spans every pending row, not just the ones that fit in one page.
+    """
+    pending_clause = Opportunity.status == OpportunityStatus.NEW.value
+    cutoff = utcnow() - timedelta(hours=aging_hours)
+
+    pending = (
+        await session.execute(
+            select(func.count()).select_from(Opportunity).where(pending_clause)
+        )
+    ).scalar_one()
+    aging = (
+        await session.execute(
+            select(func.count())
+            .select_from(Opportunity)
+            .where(pending_clause, Opportunity.created_at < cutoff)
+        )
+    ).scalar_one()
+
+    return PipelineStatsOut(
+        pending=pending, aging=aging, aging_threshold_hours=aging_hours
+    )
+
+
 @router.get("/{opportunity_id}", response_model=OpportunityDetailOut)
 async def get_opportunity(
     opportunity_id: str, session: AsyncSession = Depends(get_session)
@@ -148,12 +229,31 @@ async def get_opportunity(
             column_key=a.column.key if a.column else None,
             column_name=a.column.name if a.column else None,
             cell_value=a.cell_value,
+            # parsed here rather than by the client: the raw cell is routinely
+            # truncated mid-array and is not valid JSON
+            signals=[
+                ResearchSignalOut(
+                    signal=s.signal, evidence=s.evidence, score=s.score
+                )
+                for s in parse_signals(a.cell_value)
+            ],
+            # Rox returns narrative prose for most cells; this is the readable
+            # form of whichever shape came back.
+            narrative=parse_cell(a.cell_value).rationale,
             fetched_at=a.fetched_at,
         )
         for a in artifacts
     ]
-    detail.decision = opp.decision
-    detail.notifications = opp.notifications
+    # Validate rather than assigning the ORM rows straight in: pydantic does
+    # not validate on assignment, so the raw model objects would sit in these
+    # slots and get duck-typed at serialization time — which silently emits
+    # plain strings where the schema now promises enums.
+    detail.decision = (
+        DecisionOut.model_validate(opp.decision) if opp.decision else None
+    )
+    detail.notifications = [
+        NotificationOut.model_validate(n) for n in opp.notifications
+    ]
     detail.has_sequence = has_sequence
     return detail
 

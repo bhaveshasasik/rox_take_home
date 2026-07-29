@@ -415,3 +415,53 @@ class TestDedupe:
         assert first.opportunities_created == 3
         assert second.opportunities_created == 0
         assert len((await session.execute(select(Opportunity))).scalars().all()) == 3
+
+
+class TestFullTextIsPreferred:
+    """`cell_value` is Rox's ~300-char capped copy of `output.text`.
+
+    Reading it costs every signal past the first: an account with 2-16 signals
+    arrives truncated mid-sentence, and the JSON variant is cut mid-object so
+    not even one survives.
+    """
+
+    async def test_artifact_stores_output_text_not_the_capped_cell_value(self, session):
+        full = (
+            "Conclusion: two distinct signals.\n\nEvidence\n\n"
+            "- Growth / Expansion: revenue up 28% YoY.\n  - Confidence: 8\n\n"
+            "- Trigger Events: new CFO appointed in June.\n  - Confidence: 6\n"
+        )
+        capped = full[:300] + "..."
+
+        with mock_rox() as router:
+            router.get(url__regex=r".*/research/clever_column/[^/]+/cell/.*").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "cell_value": capped,
+                        "output": {"type": "text", "text": full, "sources": []},
+                    },
+                )
+            )
+            async with client() as rox:
+                await run_research_cycle(session, rox, trigger="manual")
+
+        artifacts = (await session.execute(select(ResearchArtifact))).scalars().all()
+        assert artifacts
+        stored = artifacts[0].cell_value
+        assert stored == full, "must keep the full narrative, not the capped copy"
+        assert not stored.endswith("...")
+
+    async def test_falls_back_to_cell_value_when_output_is_absent(self, session):
+        """Older cells and other columns may only carry `cell_value`."""
+        with mock_rox() as router:
+            router.get(url__regex=r".*/research/clever_column/[^/]+/cell/.*").mock(
+                return_value=httpx.Response(
+                    200, json={"cell_value": "7 — a single terse signal."}
+                )
+            )
+            async with client() as rox:
+                await run_research_cycle(session, rox, trigger="manual")
+
+        artifacts = (await session.execute(select(ResearchArtifact))).scalars().all()
+        assert artifacts[0].cell_value == "7 — a single terse signal."

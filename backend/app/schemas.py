@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models import DecisionType, ReasonCode
+from app.models import (
+    Channel,
+    DecisionType,
+    EmailStatus,
+    EnrollmentStatus,
+    NotificationStatus,
+    OpportunityStatus,
+    ReasonCode,
+    RunStatus,
+    SequenceStatus,
+    Stage,
+)
 
 
 class ORMModel(BaseModel):
@@ -40,18 +50,41 @@ class ResearchColumnOut(ORMModel):
     active: bool
 
 
+class ResearchSignalOut(BaseModel):
+    """One signal recovered from a research cell."""
+
+    #: the signal's own name, e.g. "Growth / Expansion"
+    signal: str | None = None
+    #: the supporting prose Rox returned for it
+    evidence: str | None = None
+    #: 0-100, same scale as `qualification_score`
+    score: int | None = None
+
+
 class ResearchArtifactOut(ORMModel):
     id: str
     column_key: str | None = None
     column_name: str | None = None
+    #: The verbatim cell. Rox truncates long cells mid-array, so this is often
+    #: invalid JSON — read `signals` instead of parsing it client-side.
     cell_value: str | None = None
+    #: `cell_value` parsed server-side, strongest signal first. The headline
+    #: `qualification_score` is the highest of these, so this is the breakdown
+    #: behind the score rather than a separate metric. Empty when Rox returned
+    #: narrative prose instead of structured signals, which is the majority
+    #: of live cells — read `narrative` in that case.
+    signals: list[ResearchSignalOut] = Field(default_factory=list)
+    #: Readable research text, safe to render directly. Joined evidence when
+    #: the cell was structured, the prose itself when it was not. Always use
+    #: this or `signals` rather than `cell_value`.
+    narrative: str | None = None
     fetched_at: datetime
 
 
 class ResearchRunOut(ORMModel):
     id: str
     trigger: str
-    status: str
+    status: RunStatus
     started_at: datetime
     finished_at: datetime | None = None
     duration_seconds: float | None = None
@@ -70,9 +103,9 @@ class ResearchRunOut(ORMModel):
 
 class DecisionOut(ORMModel):
     id: str
-    decision: str
+    decision: DecisionType
     decided_by: str | None = None
-    reason_code: str | None = None
+    reason_code: ReasonCode | None = None
     notes: str | None = None
     decided_at: datetime
     latency_seconds: float | None = None
@@ -80,9 +113,9 @@ class DecisionOut(ORMModel):
 
 class NotificationOut(ORMModel):
     id: str
-    channel: str
+    channel: Channel
     recipient: str | None = None
-    status: str
+    status: NotificationStatus
     error: str | None = None
     attempts: int
     created_at: datetime
@@ -100,8 +133,8 @@ class OpportunityOut(ORMModel):
     signal_type: str
     signal_label: str | None = None
     needs_review: bool
-    status: str
-    stage: str
+    status: OpportunityStatus
+    stage: Stage
     assigned_to: str | None = None
     created_at: datetime
     notified_at: datetime | None = None
@@ -122,6 +155,22 @@ class OpportunityListOut(BaseModel):
     items: list[OpportunityOut]
 
 
+class PipelineStatsOut(BaseModel):
+    """Queue health for the pipeline header.
+
+    Deliberately independent of the caller's filters: this answers "how is the
+    review queue doing", which stays true regardless of what the user is
+    currently looking at. Filtered counts are already on `OpportunityListOut`.
+    """
+
+    #: opportunities still awaiting a decision
+    pending: int
+    #: of those, the ones that have gone stale — a queue should reveal its own neglect
+    aging: int
+    #: echoed back so the UI labels the number with the threshold that produced it
+    aging_threshold_hours: int
+
+
 class DecisionIn(BaseModel):
     decision: DecisionType
     decided_by: str | None = None
@@ -139,7 +188,7 @@ class OutreachEmailOut(ORMModel):
     step_number: int
     subject: str
     body: str
-    status: str
+    status: EmailStatus
     send_at: datetime | None = None
     sent_at: datetime | None = None
 
@@ -157,7 +206,7 @@ class ContactOut(ORMModel):
 
 class EnrollmentOut(BaseModel):
     id: str
-    status: str
+    status: EnrollmentStatus
     enrolled_at: datetime
     contact: ContactOut
     emails: list[OutreachEmailOut] = Field(default_factory=list)
@@ -169,7 +218,7 @@ class SequenceOut(BaseModel):
     account_id: str
     account_name: str | None = None
     name: str
-    status: str
+    status: SequenceStatus
     error: str | None = None
     created_at: datetime
     enrollments: list[EnrollmentOut] = Field(default_factory=list)
@@ -185,9 +234,21 @@ class RunTriggerOut(BaseModel):
     notified: int = 0
 
 
-class MessageOut(BaseModel):
+class RoxIdentityOut(BaseModel):
+    """Whoever the configured token authenticates as.
+
+    Both fields are optional: this backs a connectivity check, and a reachable
+    Rox that happens to omit a field should still report as reachable rather
+    than failing response validation.
+    """
+
+    name: str | None = None
+    email: str | None = None
+
+
+class RoxMeOut(BaseModel):
     message: str
-    detail: Any | None = None
+    detail: RoxIdentityOut | None = None
 
 
 # ----------------------------------------------------------------------
@@ -204,9 +265,15 @@ class HeadlineOut(BaseModel):
 
 
 class FunnelStepOut(BaseModel):
-    stage: str
+    stage: Stage
     count: int
     pct_of_total: float
+    #: step-to-step conversion — this step's count over the *previous* step's.
+    #: 100.0 on the first step, which has nothing to convert from. Null when
+    #: the previous step is empty: converting out of zero is undefined, and
+    #: reporting it as 0% next to a non-zero count reads as a collapse that
+    #: did not happen.
+    pct_of_previous: float | None = None
 
 
 class FunnelOut(BaseModel):
@@ -216,6 +283,10 @@ class FunnelOut(BaseModel):
 
 class ScoreBandOut(BaseModel):
     band: str
+    #: inclusive numeric bounds, so charts can sort and position bands
+    #: without parsing the `band` label
+    lo: int
+    hi: int
     decided: int
     accepted: int
     acceptance_rate: float
@@ -223,6 +294,8 @@ class ScoreBandOut(BaseModel):
 
 class ScoreCalibrationOut(BaseModel):
     total_decided: int
+    #: number of buckets used; null when the default named bands are in effect
+    buckets: int | None = None
     bands: list[ScoreBandOut]
 
 
@@ -236,20 +309,43 @@ class SignalPerformanceOut(BaseModel):
 
 
 class DecisionLatencyOut(BaseModel):
+    #: every decision in the window, including ones we could not time
     count: int
+    #: decisions that actually contributed to the percentiles below. When this
+    #: is 0 the medians are null because there was nothing to measure — which
+    #: is a different story from "no decisions yet", and the UI should say so.
+    measured: int
+    #: notified_at -> decided_at, the true review latency
+    from_notification: int
+    #: created_at -> decided_at, the fallback used when an opportunity was
+    #: decided without ever being notified
+    from_creation: int
     median_hours: float | None = None
     p90_hours: float | None = None
 
 
 class RejectionReasonOut(BaseModel):
-    reason_code: str | None = None
+    #: null means the rejecting user did not supply a reason
+    reason_code: ReasonCode | None = None
     count: int
     pct: float
+
+
+class RejectionReasonPointOut(BaseModel):
+    #: bucket start, `YYYY-MM-DD` for day / ISO `YYYY-Www` for week
+    period: str
+    reason_code: ReasonCode | None = None
+    count: int
 
 
 class RejectionReasonsOut(BaseModel):
     total_rejections: int
     reasons: list[RejectionReasonOut]
+    #: bucket unit in effect; null when `group_by` was not requested
+    group_by: str | None = None
+    #: flat (period, reason_code, count) rows — empty unless `group_by` is set.
+    #: Long form rather than wide so every field stays typed; pivot client-side.
+    series: list[RejectionReasonPointOut] = Field(default_factory=list)
 
 
 class UncoveredAccountOut(BaseModel):
@@ -276,7 +372,7 @@ class ProspectingYieldOut(BaseModel):
 class RecentRunOut(BaseModel):
     id: str
     trigger: str
-    status: str
+    status: RunStatus
     started_at: datetime
     finished_at: datetime | None = None
     duration_seconds: float | None = None
@@ -292,10 +388,27 @@ class RunHealthOut(BaseModel):
     recent_runs: list[RecentRunOut]
 
 
+class JobStateCountOut(BaseModel):
+    #: Rox-side job state (COMPLETED, STOPPED, ...). Deliberately not an enum:
+    #: Rox owns this vocabulary, and a closed union would fail validation the
+    #: day they add a state.
+    state: str
+    count: int
+
+
+class TaskTypeTelemetryOut(BaseModel):
+    #: Rox-side task type (CUSTOM_CELL_GENERATION, ...) — open set, as above
+    task_type: str
+    total: int
+    states: list[JobStateCountOut]
+
+
 class JobTelemetryOut(BaseModel):
     lookback_hours: int
     total_jobs: int
-    by_task_type: dict[str, dict[str, int]]
+    #: A list rather than a `{task_type: {state: count}}` record so both levels
+    #: stay typed and the frontend can map over it without `Object.entries`.
+    by_task_type: list[TaskTypeTelemetryOut]
     avg_cell_generation_seconds: float | None = None
 
 

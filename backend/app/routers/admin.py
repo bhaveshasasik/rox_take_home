@@ -17,9 +17,10 @@ from app.models import Notification, Opportunity
 from app.rox.client import RoxClient
 from app.schemas import (
     DigestResultOut,
-    MessageOut,
     NotificationOut,
     ResearchRunOut,
+    RoxIdentityOut,
+    RoxMeOut,
     RunTriggerOut,
 )
 from app.services.notifications import notify_opportunity, retry_notification, send_digest
@@ -93,11 +94,12 @@ async def trigger_digest(session: AsyncSession = Depends(get_session)) -> dict:
     return await send_digest(session)
 
 
-@router.get("/admin/rox/me", response_model=MessageOut)
-async def rox_me() -> MessageOut:
+@router.get("/admin/rox/me", response_model=RoxMeOut)
+async def rox_me() -> RoxMeOut:
     """Connectivity check — confirms the token reaches Rox."""
     try:
         async with RoxClient() as rox:
-            return MessageOut(message="ok", detail=await rox.get_me())
+            identity = RoxIdentityOut.model_validate(await rox.get_me())
+            return RoxMeOut(message="ok", detail=identity)
     except Exception as exc:  # noqa: BLE001 - surfaced to the operator
         raise HTTPException(502, f"Rox unreachable: {exc}") from exc

@@ -16,7 +16,7 @@ cp .env.example .env          # fill in ROX_API_TOKEN
 Swagger UI: http://localhost:8000/docs
 
 ```bash
-.venv/bin/python -m pytest -q      # 128 tests, Rox mocked via respx
+.venv/bin/python -m pytest -q      # 102 tests, Rox mocked via respx
 ```
 
 Trigger a cycle without waiting for the scheduler:
@@ -110,6 +110,19 @@ same underlying signal.
 | POST | `/prospecting/opportunities/{id}/run` | retry prospecting |
 | GET | `/reporting/overview` | every dashboard section in one call |
 | GET | `/reporting/{funnel,score-calibration,signal-performance,decision-latency,rejection-reasons,account-coverage,prospecting-yield,run-health,job-telemetry}` | individual reports |
+
+Every database-backed report accepts an optional `start`/`end` window, half-open
+as `[start, end)` so adjacent windows tile without double-counting a boundary
+row. Each filters on the timestamp of the event it measures — opportunity
+`created_at` for cohort metrics, `decided_at` for decision metrics,
+`started_at` for run health; see the `app.services.reporting` docstring.
+`job-telemetry` is the exception: it reads the live Rox task queue and keeps its
+own `lookback_hours`. Two reports take an extra knob:
+
+| Endpoint | Param | Effect |
+|---|---|---|
+| `/reporting/score-calibration` | `buckets=N` | equal-width score buckets (`10` for deciles). Omit for the default named bands `0-59 / 60-74 / 75-89 / 90-100`. |
+| `/reporting/rejection-reasons` | `group_by=day\|week` | fills `series` with long-form `(period, reason_code, count)` rows for a reasons-over-time chart. Omit for totals only. |
 | GET | `/research/runs`, `/research/columns` | automation visibility |
 | GET | `/notifications`, POST `/notifications/{id}/retry` | delivery audit + retry |
 | POST | `/admin/research/run` | trigger a cycle now |
@@ -122,7 +135,7 @@ same underlying signal.
 | Funnel | Where do opportunities die? Stage attainment derives from facts (was it notified? does it have contacts?) not the mutable `stage` column, so rejections are counted at the stages they *did* reach and conversion isn't flattered. |
 | **Score calibration** | Is the score predictive? Acceptance rate per score band — a flat line means the score is decoration. |
 | Signal performance | Which signals produce opportunities people accept? |
-| Decision latency | Is human review the bottleneck? (median / p90) |
+| Decision latency | Is human review the bottleneck? (median / p90). Timed from `notified_at` where available, falling back to `created_at` for opportunities decided without ever being notified — otherwise the metric silently reports null whenever notifications are misconfigured, which reads as "no decisions" rather than "not measurable". `measured` vs `count` tells the two apart, and `from_notification` / `from_creation` say which basis produced the number. |
 | Rejection reasons | What to fix upstream — e.g. lots of `already_engaged` ⇒ dedupe against CRM first. |
 | Account coverage | Which target accounts are we ignoring entirely? |
 | Prospecting yield | Does an accept reliably become real outreach? |

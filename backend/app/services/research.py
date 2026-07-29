@@ -287,7 +287,16 @@ async def run_research_cycle(
                 if data is None:
                     continue
 
-                value = data.get("cell_value") or None
+                # Prefer `output.text`. `cell_value` is Rox's ~300-char capped
+                # copy — frequently empty, and when populated it truncates the
+                # narrative mid-sentence, leaving at most one recoverable
+                # signal out of the 2-16 an account typically has.
+                output = data.get("output")
+                value = (
+                    (output.get("text") if isinstance(output, dict) else None)
+                    or data.get("cell_value")
+                    or None
+                )
                 if value:
                     run.cells_fetched += 1
 

@@ -46,10 +46,8 @@ async def record_decision(
     now = utcnow()
     latency = None
     if opportunity.notified_at is not None:
-        notified = opportunity.notified_at
-        if notified.tzinfo is None:
-            notified = notified.replace(tzinfo=now.tzinfo)
-        latency = (now - notified).total_seconds()
+        # Both sides are tz-aware: `UtcDateTime` normalises on read.
+        latency = (now - opportunity.notified_at).total_seconds()
 
     record = Decision(
         opportunity_id=opportunity.id,

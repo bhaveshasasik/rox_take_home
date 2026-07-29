@@ -5,9 +5,12 @@
 This is the test that proves the six functional requirements hold together.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import httpx
 import pytest
 import pytest_asyncio
+import respx
 from sqlalchemy import select
 
 from app.db import get_session
@@ -292,6 +295,134 @@ class TestOpportunityApi:
         page2 = await client.get("/opportunities", params={"limit": 2, "offset": 2})
         assert len(page2.json()["items"]) == 1
 
+    async def test_stage_sorts_in_funnel_order_not_alphabetical(
+        self, session, seeded, client
+    ):
+        """Alphabetically `accepted` precedes `opportunity_created`; the funnel
+        runs the other way, and the funnel order is the useful one."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+        await client.post(
+            f"/opportunities/{opps[1].id}/decision", json={"decision": "reject"}
+        )
+        # opps[2] stays at opportunity_created
+
+        body = (
+            await client.get("/opportunities", params={"sort": "stage", "order": "asc"})
+        ).json()
+        stages = [i["stage"] for i in body["items"]]
+        assert stages == ["opportunity_created", "accepted", "rejected"]
+
+    async def test_status_sorts_undecided_first(self, session, seeded, client):
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+        await client.post(
+            f"/opportunities/{opps[1].id}/decision", json={"decision": "reject"}
+        )
+
+        body = (
+            await client.get("/opportunities", params={"sort": "status", "order": "asc"})
+        ).json()
+        assert [i["status"] for i in body["items"]] == ["new", "accepted", "rejected"]
+
+    async def test_signal_type_is_sortable(self, session, seeded, client):
+        body = (
+            await client.get(
+                "/opportunities", params={"sort": "signal_type", "order": "asc"}
+            )
+        ).json()
+        signals = [i["signal_type"] for i in body["items"]]
+        assert signals == sorted(signals)
+
+    async def test_timestamps_carry_a_utc_offset(self, session, seeded, client):
+        """Without an offset, JS parses the value as local time and every
+        rendered age is wrong by the viewer's UTC offset."""
+        item = (await client.get("/opportunities")).json()["items"][0]
+
+        raw = item["created_at"]
+        # `Z` or `+00:00` — either is explicit; a bare `2026-07-28T06:26:29` is not
+        assert raw.endswith("Z") or raw.endswith("+00:00"), f"no offset: {raw!r}"
+        parsed = datetime.fromisoformat(raw)
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == timedelta(0)
+
+    async def test_stats_counts_pending_and_aging(self, session, seeded, client):
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        # age two of the three past the threshold
+        opps[0].created_at = datetime.now(timezone.utc) - timedelta(hours=72)
+        opps[1].created_at = datetime.now(timezone.utc) - timedelta(hours=49)
+        await session.commit()
+
+        body = (await client.get("/opportunities/stats")).json()
+        assert body == {"pending": 3, "aging": 2, "aging_threshold_hours": 48}
+
+    async def test_stats_excludes_decided_opportunities(self, session, seeded, client):
+        """An old *decided* row is not a stale queue item — it left the queue."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        opps[0].created_at = datetime.now(timezone.utc) - timedelta(hours=99)
+        await session.commit()
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+
+        body = (await client.get("/opportunities/stats")).json()
+        assert body["pending"] == 2
+        assert body["aging"] == 0
+
+    async def test_stats_threshold_is_configurable(self, session, seeded, client):
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        opps[0].created_at = datetime.now(timezone.utc) - timedelta(hours=10)
+        await session.commit()
+
+        assert (await client.get("/opportunities/stats")).json()["aging"] == 0
+        body = (
+            await client.get("/opportunities/stats", params={"aging_hours": 6})
+        ).json()
+        assert body == {"pending": 3, "aging": 1, "aging_threshold_hours": 6}
+
+    async def test_stats_route_is_not_shadowed_by_the_detail_route(self, client):
+        """`/{opportunity_id}` would swallow "stats" as an id if declared first."""
+        resp = await client.get("/opportunities/stats")
+        assert resp.status_code == 200
+        assert "pending" in resp.json()
+
+        # and the detail route still resolves real ids, i.e. nothing was masked
+        assert (await client.get("/opportunities/not-a-real-id")).status_code == 404
+
+    async def test_stats_is_safe_on_an_empty_database(self, client):
+        body = (await client.get("/opportunities/stats")).json()
+        assert body == {"pending": 0, "aging": 0, "aging_threshold_hours": 48}
+
+    async def test_nullable_timestamps_stay_null(self, session, seeded, client):
+        """The offset change must not turn an absent timestamp into a value."""
+        item = (await client.get("/opportunities")).json()["items"][0]
+        assert item["notified_at"] is None
+        assert item["decided_at"] is None
+
     async def test_detail_includes_supporting_research(self, session, seeded, client):
         opp = (await session.execute(select(Opportunity))).scalars().first()
         resp = await client.get(f"/opportunities/{opp.id}")
@@ -567,6 +698,415 @@ class TestReporting:
         assert body["total_cells_fetched"] == 3
         assert len(body["recent_runs"]) == 1
 
+    async def test_funnel_reports_step_to_step_conversion(self, session, seeded, client):
+        await self._decide_all(session, client)
+        steps = (await client.get("/reporting/funnel")).json()["steps"]
+
+        by_stage = {s["stage"]: s for s in steps}
+        # the first step converts from nothing, so it anchors at 100%
+        assert steps[0]["pct_of_previous"] == 100.0
+        # 2 of 3 notified opportunities were accepted
+        assert by_stage["accepted"]["pct_of_previous"] == pytest.approx(66.7, abs=0.1)
+        # ...but only 2 of 3 of the total, which is the distinction
+        # pct_of_total alone could not express
+        assert by_stage["accepted"]["pct_of_total"] == pytest.approx(66.7, abs=0.1)
+        assert by_stage["sequenced"]["pct_of_previous"] == 100.0
+
+    async def test_conversion_out_of_an_empty_step_is_undefined(
+        self, session, seeded, client
+    ):
+        """Accepting without notifying must not read as a 0% conversion."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+
+        steps = {s["stage"]: s for s in (await client.get("/reporting/funnel")).json()["steps"]}
+        assert steps["notified"]["count"] == 0
+        assert steps["accepted"]["count"] == 1
+        assert steps["accepted"]["pct_of_previous"] is None
+
+
+class TestReportingWindows:
+    """`start`/`end`, score bucketing, and the rejection time series."""
+
+    async def _created_at(self, client) -> list[datetime]:
+        items = (await client.get("/opportunities")).json()["items"]
+        return sorted(datetime.fromisoformat(i["created_at"]) for i in items)
+
+    async def _decide_without_notifying(self, session, client):
+        """Decide straight from the list view — the path that records no latency."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+        await client.post(
+            f"/opportunities/{opps[1].id}/decision",
+            json={"decision": "reject", "reason_code": "low_signal"},
+        )
+        return opps
+
+    async def test_window_is_half_open(self, session, seeded, client):
+        created = await self._created_at(client)
+        newest = created[-1].isoformat()
+
+        # start is inclusive -> the newest opportunity is kept
+        started = (await client.get("/reporting/funnel", params={"start": newest})).json()
+        assert started["steps"][0]["count"] == 1
+
+        # end is exclusive -> the same row falls out, so adjacent windows
+        # tile without double-counting the boundary
+        ended = (await client.get("/reporting/funnel", params={"end": newest})).json()
+        assert ended["steps"][0]["count"] == 2
+
+    async def test_window_applies_to_every_report(self, session, seeded, client):
+        await self._decide_without_notifying(session, client)
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        params = {"start": future}
+
+        assert (await client.get("/reporting/funnel", params=params)).json()["steps"][0][
+            "count"
+        ] == 0
+        assert (
+            await client.get("/reporting/score-calibration", params=params)
+        ).json()["total_decided"] == 0
+        assert (
+            await client.get("/reporting/rejection-reasons", params=params)
+        ).json()["total_rejections"] == 0
+        assert (await client.get("/reporting/decision-latency", params=params)).json()[
+            "count"
+        ] == 0
+        assert (await client.get("/reporting/overview", params=params)).json()[
+            "headline"
+        ]["total_opportunities"] == 0
+
+    async def test_coverage_denominator_ignores_the_window(self, session, seeded, client):
+        """Accounts we know about, not accounts created during the window."""
+        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        body = (
+            await client.get("/reporting/account-coverage", params={"start": future})
+        ).json()
+        assert body["total_accounts"] == 3
+        assert body["accounts_with_opportunities"] == 0
+        assert body["coverage_rate"] == 0.0
+
+    async def test_inverted_window_is_rejected(self, client):
+        resp = await client.get(
+            "/reporting/funnel",
+            params={"start": "2026-02-01T00:00:00", "end": "2026-01-01T00:00:00"},
+        )
+        assert resp.status_code == 422
+
+    async def test_score_calibration_supports_deciles(self, session, seeded, client):
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        for opp in opps:
+            await client.post(
+                f"/opportunities/{opp.id}/decision", json={"decision": "accept"}
+            )
+
+        body = (
+            await client.get("/reporting/score-calibration", params={"buckets": 10})
+        ).json()
+
+        assert body["buckets"] == 10
+        assert len(body["bands"]) == 10
+        assert [b["band"] for b in body["bands"]][:2] == ["0-9", "10-19"]
+        # the top bucket absorbs the endpoint so a perfect 100 is never dropped
+        assert body["bands"][-1]["lo"] == 90
+        assert body["bands"][-1]["hi"] == 100
+        # no opportunity may fall between the cracks
+        assert sum(b["decided"] for b in body["bands"]) == body["total_decided"] == 3
+
+    async def test_default_bands_expose_numeric_bounds(self, session, seeded, client):
+        """Charts sort and position on lo/hi rather than parsing the label."""
+        body = (await client.get("/reporting/score-calibration")).json()
+        assert body["buckets"] is None
+        assert [(b["lo"], b["hi"]) for b in body["bands"]] == [
+            (0, 59),
+            (60, 74),
+            (75, 89),
+            (90, 100),
+        ]
+
+    async def test_rejection_reasons_series_is_empty_without_group_by(
+        self, session, seeded, client
+    ):
+        await self._decide_without_notifying(session, client)
+        body = (await client.get("/reporting/rejection-reasons")).json()
+        assert body["group_by"] is None
+        assert body["series"] == []
+
+    async def test_rejection_reasons_bucketed_by_day(self, session, seeded, client):
+        await self._decide_without_notifying(session, client)
+        body = (
+            await client.get("/reporting/rejection-reasons", params={"group_by": "day"})
+        ).json()
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        assert body["group_by"] == "day"
+        assert body["series"] == [
+            {"period": today, "reason_code": "low_signal", "count": 1}
+        ]
+        # the series must reconcile with the totals it summarises
+        assert sum(p["count"] for p in body["series"]) == body["total_rejections"]
+
+    async def test_rejection_reasons_bucketed_by_week(self, session, seeded, client):
+        await self._decide_without_notifying(session, client)
+        body = (
+            await client.get(
+                "/reporting/rejection-reasons", params={"group_by": "week"}
+            )
+        ).json()
+        assert body["series"][0]["period"] == datetime.now(timezone.utc).strftime(
+            "%G-W%V"
+        )
+
+    async def test_unknown_group_by_is_rejected(self, client):
+        resp = await client.get(
+            "/reporting/rejection-reasons", params={"group_by": "month"}
+        )
+        assert resp.status_code == 422
+
+    async def test_missing_reason_stays_null(self, session, seeded, client):
+        """No synthetic 'unspecified' code — it would not validate as a ReasonCode."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "reject"}
+        )
+        body = (await client.get("/reporting/rejection-reasons")).json()
+        assert body["reasons"] == [{"reason_code": None, "count": 1, "pct": 100.0}]
+
+    async def test_latency_falls_back_to_creation_when_never_notified(
+        self, session, seeded, client
+    ):
+        """The case that used to report a null median and no reason why."""
+        await self._decide_without_notifying(session, client)
+        body = (await client.get("/reporting/decision-latency")).json()
+
+        assert body["count"] == 2
+        assert body["measured"] == 2
+        assert body["from_notification"] == 0
+        assert body["from_creation"] == 2
+        assert body["median_hours"] is not None
+        assert body["p90_hours"] >= body["median_hours"]
+
+    async def test_latency_prefers_the_notification_basis(self, session, seeded, client):
+        """A notified opportunity is timed from the notification, not creation."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await notify_opportunity(session, opps[0], send=RecordingSend())
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+        await client.post(
+            f"/opportunities/{opps[1].id}/decision", json={"decision": "accept"}
+        )
+
+        body = (await client.get("/reporting/decision-latency")).json()
+        assert body["count"] == 2
+        assert body["from_notification"] == 1
+        assert body["from_creation"] == 1
+        assert body["measured"] == 2
+
+    async def test_latency_reports_zero_measured_on_an_empty_database(self, client):
+        """`count` and `measured` must be tellable apart, not both silently 0."""
+        body = (await client.get("/reporting/decision-latency")).json()
+        assert body["count"] == 0
+        assert body["measured"] == 0
+        assert body["median_hours"] is None
+
+    async def test_windowed_reports_are_safe_on_empty_database(self, client):
+        params = {"start": "2026-01-01T00:00:00", "end": "2026-02-01T00:00:00"}
+        for path in (
+            "/reporting/overview",
+            "/reporting/funnel",
+            "/reporting/score-calibration",
+            "/reporting/decision-latency",
+            "/reporting/rejection-reasons",
+            "/reporting/account-coverage",
+            "/reporting/prospecting-yield",
+            "/reporting/run-health",
+            "/reporting/signal-performance",
+        ):
+            resp = await client.get(path, params=params)
+            assert resp.status_code == 200, f"{path} failed on an empty window"
+
+
+class TestRoxBackedAdminEndpoints:
+    """The two endpoints whose payloads come from Rox rather than our database."""
+
+    JOBS = [
+        {
+            "run_id": "cell-1",
+            "task_type": "CUSTOM_CELL_GENERATION",
+            "current_state": "COMPLETED",
+            "created_on": "2026-07-28T00:00:00Z",
+            "last_modified": "2026-07-28T00:02:00Z",
+        },
+        {
+            "run_id": "cell-2",
+            "task_type": "CUSTOM_CELL_GENERATION",
+            "current_state": "COMPLETED",
+            "created_on": "2026-07-28T00:00:00Z",
+            "last_modified": "2026-07-28T00:01:00Z",
+        },
+        {
+            "run_id": "cell-3",
+            "task_type": "CUSTOM_CELL_GENERATION",
+            "current_state": "STOPPED",
+        },
+        {
+            "run_id": "col-1",
+            "task_type": "CUSTOM_COLUMN_GENERATION",
+            "current_state": "COMPLETED",
+        },
+    ]
+
+    async def test_job_telemetry_is_a_typed_list(self, client):
+        with respx.mock(base_url=BASE, assert_all_called=False) as router:
+            router.get("/priority_jobs").mock(
+                return_value=httpx.Response(200, json=self.JOBS)
+            )
+            body = (await client.get("/reporting/job-telemetry")).json()
+
+        assert body["total_jobs"] == 4
+        # busiest task type first, so the table reads top-down unsorted
+        assert [t["task_type"] for t in body["by_task_type"]] == [
+            "CUSTOM_CELL_GENERATION",
+            "CUSTOM_COLUMN_GENERATION",
+        ]
+        cells = body["by_task_type"][0]
+        assert cells["total"] == 3
+        assert cells["states"] == [
+            {"state": "COMPLETED", "count": 2},
+            {"state": "STOPPED", "count": 1},
+        ]
+        # 120s and 60s; the STOPPED job contributes no duration
+        assert body["avg_cell_generation_seconds"] == 90.0
+
+    async def test_job_telemetry_survives_an_empty_queue(self, client):
+        with respx.mock(base_url=BASE, assert_all_called=False) as router:
+            router.get("/priority_jobs").mock(return_value=httpx.Response(200, json=[]))
+            body = (await client.get("/reporting/job-telemetry")).json()
+
+        assert body["total_jobs"] == 0
+        assert body["by_task_type"] == []
+        assert body["avg_cell_generation_seconds"] is None
+
+    async def test_lookback_is_bounded(self, client):
+        assert (
+            await client.get("/reporting/job-telemetry", params={"lookback_hours": 0})
+        ).status_code == 422
+
+    async def test_rox_me_returns_a_typed_identity(self, client):
+        with respx.mock(base_url=BASE, assert_all_called=False) as router:
+            router.get("/user/me").mock(
+                return_value=httpx.Response(
+                    200, json={"name": "Rox SE", "email": "rep@rox.com"}
+                )
+            )
+            body = (await client.get("/admin/rox/me")).json()
+
+        assert body == {
+            "message": "ok",
+            "detail": {"name": "Rox SE", "email": "rep@rox.com"},
+        }
+
+    async def test_rox_me_tolerates_a_partial_identity(self, client):
+        """A reachable Rox that omits a field is still reachable."""
+        with respx.mock(base_url=BASE, assert_all_called=False) as router:
+            router.get("/user/me").mock(
+                return_value=httpx.Response(200, json={"name": "Rox SE"})
+            )
+            resp = await client.get("/admin/rox/me")
+
+        assert resp.status_code == 200
+        assert resp.json()["detail"] == {"name": "Rox SE", "email": None}
+
+    async def test_rox_me_reports_an_unreachable_rox(self, client):
+        with respx.mock(base_url=BASE, assert_all_called=False) as router:
+            router.get("/user/me").mock(return_value=httpx.Response(500))
+            resp = await client.get("/admin/rox/me")
+
+        assert resp.status_code == 502
+
+
+class TestEnumSerialization:
+    """Enum-typed response fields must still emit plain JSON strings."""
+
+    async def test_opportunity_detail_enums_are_strings(self, session, seeded, client):
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        await notify_opportunity(session, opp, send=RecordingSend())
+        await client.post(
+            f"/opportunities/{opp.id}/decision",
+            json={"decision": "reject", "reason_code": "bad_timing"},
+        )
+
+        body = (await client.get(f"/opportunities/{opp.id}")).json()
+        assert body["status"] == "rejected"
+        assert body["stage"] == "rejected"
+        assert body["decision"]["decision"] == "reject"
+        assert body["decision"]["reason_code"] == "bad_timing"
+        assert body["notifications"][0]["channel"] == "email"
+        assert body["notifications"][0]["status"] == "sent"
+
+    async def test_enums_are_declared_as_unions_in_the_spec(self, client):
+        """The whole point: the generated client gets a union, not `string`."""
+        schemas = (await client.get("/openapi.json")).json()["components"]["schemas"]
+
+        assert schemas["OpportunityStatus"]["enum"] == ["new", "accepted", "rejected"]
+        status = schemas["OpportunityOut"]["properties"]["status"]
+        assert status["$ref"].endswith("OpportunityStatus")
+        assert schemas["FunnelStepOut"]["properties"]["stage"]["$ref"].endswith("Stage")
+
+    async def test_no_response_field_generates_as_unknown(self, client):
+        """No bare dicts or untyped `Any` left anywhere in the response models."""
+        spec = (await client.get("/openapi.json")).json()
+        schemas = spec["components"]["schemas"]
+
+        def is_loose(node: dict) -> bool:
+            if "$ref" in node or "enum" in node:
+                return False
+            if "anyOf" in node:
+                return any(is_loose(x) for x in node["anyOf"])
+            if node.get("type") == "array":
+                return is_loose(node.get("items", {}))
+            if node.get("type") == "object":
+                extra = node.get("additionalProperties")
+                # `{}` / `True` means "any value"; a dict of known type is fine
+                if extra is True or extra == {}:
+                    return True
+                return not node.get("properties") and extra is None
+            # a schema with no type at all is an untyped `Any`
+            return not node.get("type")
+
+        loose = [
+            f"{name}.{field}"
+            for name, body in schemas.items()
+            for field, node in body.get("properties", {}).items()
+            if is_loose(node)
+        ]
+        assert loose == []
+
 
 class TestAccountsApi:
     async def test_accounts_and_runs_are_listable(self, session, seeded, client):
@@ -582,3 +1122,74 @@ class TestAccountsApi:
         assert len(runs) == 1
         assert runs[0]["status"] == "succeeded"
         assert runs[0]["duration_seconds"] is not None
+
+
+class TestDetailResearchSignals:
+    """The detail screen renders `signals`, never the raw cell."""
+
+    async def test_detail_exposes_parsed_signals(self, session, seeded, client):
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        body = (await client.get(f"/opportunities/{opp.id}")).json()
+
+        assert body["research"], "fixture should attach a research artifact"
+        artifact = body["research"][0]
+        assert artifact["signals"], "signals must be parsed server-side"
+
+        top = artifact["signals"][0]
+        assert set(top) == {"signal", "evidence", "score"}
+        assert top["signal"]
+        assert top["evidence"]
+
+    async def test_top_signal_explains_the_headline_score(self, session, seeded, client):
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        body = (await client.get(f"/opportunities/{opp.id}")).json()
+        assert body["research"][0]["signals"][0]["score"] == body["qualification_score"]
+
+    async def test_raw_cell_is_still_available_but_unparseable_by_clients(
+        self, session, seeded, client
+    ):
+        """`cell_value` stays for debugging; `signals` is what the UI reads."""
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        artifact = (await client.get(f"/opportunities/{opp.id}")).json()["research"][0]
+        assert artifact["cell_value"]
+
+
+class TestDetailNarrative:
+    """Most live cells are narrative prose, not structured signals."""
+
+    async def test_narrative_is_present_for_prose_cells(self, session, seeded, client):
+        from app.models import ResearchArtifact
+
+        artifact = (await session.execute(select(ResearchArtifact))).scalars().first()
+        artifact.cell_value = "9 — Strongest signals: a large equity raise this quarter."
+        await session.commit()
+
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        research = (await client.get(f"/opportunities/{opp.id}")).json()["research"]
+        entry = next(r for r in research if r["id"] == artifact.id)
+
+        # nothing structured to show, but the prose is still readable
+        assert entry["signals"] == []
+        assert entry["narrative"] == "9 — Strongest signals: a large equity raise this quarter."
+
+    async def test_narrative_is_joined_evidence_for_structured_cells(
+        self, session, seeded, client
+    ):
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        entry = (await client.get(f"/opportunities/{opp.id}")).json()["research"][0]
+        assert entry["signals"], "fixture cell is structured"
+        for signal in entry["signals"]:
+            assert signal["evidence"] in entry["narrative"]
+
+    async def test_narrative_is_null_for_an_empty_cell(self, session, seeded, client):
+        from app.models import ResearchArtifact
+
+        artifact = (await session.execute(select(ResearchArtifact))).scalars().first()
+        artifact.cell_value = None
+        await session.commit()
+
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        research = (await client.get(f"/opportunities/{opp.id}")).json()["research"]
+        entry = next(r for r in research if r["id"] == artifact.id)
+        assert entry["narrative"] is None
+        assert entry["signals"] == []
