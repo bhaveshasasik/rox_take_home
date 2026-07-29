@@ -214,6 +214,11 @@ class ResearchRun(Base):
     cells_unscoreable: Mapped[int] = mapped_column(Integer, default=0)
     artifacts_created: Mapped[int] = mapped_column(Integer, default=0)
     opportunities_created: Mapped[int] = mapped_column(Integer, default=0)
+    #: Comma-joined per-run overrides ("force_extract,ignore_cooldown"), NULL
+    #: for an unforced run. Recorded so run health can show a run was forced —
+    #: a forced run's numbers (opportunities past cooldown, re-extractions)
+    #: are not comparable to a scheduled run's and must not read as trend.
+    overrides: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     artifacts: Mapped[list[ResearchArtifact]] = relationship(back_populates="run")

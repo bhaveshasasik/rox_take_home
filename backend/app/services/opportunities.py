@@ -52,6 +52,7 @@ async def should_skip_account(
     signal_type: str | None = None,
     *,
     new_score: int | None,
+    ignore_cooldown: bool = False,
 ) -> str | None:
     """Return a reason to skip this account, or None to proceed.
 
@@ -109,6 +110,12 @@ async def should_skip_account(
             new_score=new_score,
         )
 
+    if ignore_cooldown:
+        # Per-run override from the manual trigger. Only the cooldown: the
+        # open-opportunity guard above still applies, because superseding is
+        # the sanctioned way past it and stacking duplicates is not.
+        return None
+
     cutoff = utcnow() - timedelta(days=settings.opportunity_cooldown_days)
     recent = (
         await session.execute(
@@ -132,7 +139,11 @@ async def should_skip_account(
 
 
 async def create_opportunities_for_run(
-    session: AsyncSession, run: ResearchRun, *, notify: bool = True
+    session: AsyncSession,
+    run: ResearchRun,
+    *,
+    notify: bool = True,
+    ignore_cooldown: bool = False,
 ) -> list[Opportunity]:
     """Parse each account's research artifact from this run and create opportunities.
 
@@ -206,7 +217,10 @@ async def create_opportunities_for_run(
             continue
 
         skip_reason = await should_skip_account(
-            session, artifact.account_id, new_score=parsed.score
+            session,
+            artifact.account_id,
+            new_score=parsed.score,
+            ignore_cooldown=ignore_cooldown,
         )
         if skip_reason:
             log.info(

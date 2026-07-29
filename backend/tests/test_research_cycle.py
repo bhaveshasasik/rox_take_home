@@ -209,6 +209,21 @@ class TestResearchCycle:
 
         assert run.status == RunStatus.SUCCEEDED.value
         assert run.error is None
+        assert run.overrides is None, "an unforced run records no overrides"
+
+    async def test_forced_run_records_its_overrides(self, session):
+        with mock_rox():
+            async with client() as rox:
+                run = await run_research_cycle(
+                    session,
+                    rox,
+                    trigger="manual",
+                    force_extract=True,
+                    ignore_cooldown=True,
+                )
+
+        assert run.status == RunStatus.SUCCEEDED.value
+        assert run.overrides == "force_extract,ignore_cooldown"
         assert run.accounts_scanned == 3
 
         accounts = (await session.execute(select(Account))).scalars().all()
@@ -480,6 +495,32 @@ class TestDedupe:
             session, status=OpportunityStatus.SUPERSEDED.value
         )
         assert await should_skip_account(session, account.id, new_score=None) is None
+
+    async def test_ignore_cooldown_skips_only_the_cooldown(self, session):
+        """The per-run override frees recently-decided accounts, but an open
+        NEW opportunity still blocks — superseding is the sanctioned way past
+        that guard, not the override."""
+        from datetime import timedelta
+
+        account, _ = await self._seed(
+            session,
+            status=OpportunityStatus.REJECTED.value,
+            decided_at=(utcnow() - timedelta(days=1)).replace(tzinfo=None),
+        )
+        assert await should_skip_account(session, account.id, new_score=None)
+        assert (
+            await should_skip_account(
+                session, account.id, new_score=None, ignore_cooldown=True
+            )
+            is None
+        )
+
+    async def test_ignore_cooldown_does_not_free_open_opportunities(self, session):
+        account, opp = await self._seed(session, status=OpportunityStatus.NEW.value)
+        reason = await should_skip_account(
+            session, account.id, new_score=opp.qualification_score, ignore_cooldown=True
+        )
+        assert reason and "pending review" in reason
 
     async def test_dedupe_is_per_account_not_per_signal(self, session):
         """signal_type is derived from the cell's own label and can drift between

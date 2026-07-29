@@ -203,7 +203,9 @@ async def wait_for_jobs(rox: RoxClient, run_ids: list[str], timeout: int) -> int
 # ----------------------------------------------------------------------
 
 
-async def _extract_signals(session: AsyncSession, run: ResearchRun) -> None:
+async def _extract_signals(
+    session: AsyncSession, run: ResearchRun, *, force: bool = False
+) -> None:
     """Structured extraction over the artifacts this run just wrote.
 
     On by default (`EXTRACTION_ENABLED`) since the daily cadence. Cost scales
@@ -228,7 +230,7 @@ async def _extract_signals(session: AsyncSession, run: ResearchRun) -> None:
     from app.signals.service import extract_run as extract_artifacts
 
     try:
-        stats = await extract_artifacts(session, run_id=run.id)
+        stats = await extract_artifacts(session, run_id=run.id, force=force)
     except Exception as exc:  # noqa: BLE001 - the cycle must survive this
         log.error("extraction pass failed", run_id=run.id, error=str(exc)[:500])
         return
@@ -251,14 +253,38 @@ async def run_research_cycle(
     create_opportunities: bool = True,
     refresh: bool | None = None,
     notify: bool = True,
+    force_extract: bool = False,
+    ignore_cooldown: bool = False,
 ) -> ResearchRun:
     settings = get_settings()
     do_refresh = settings.research_refresh_enabled if refresh is None else refresh
 
-    run = ResearchRun(trigger=trigger, status=RunStatus.RUNNING.value)
+    # Per-run only, and recorded on the row: run health must be able to show
+    # that a run's numbers came from overrides rather than from the pipeline
+    # drifting. Neither flag touches settings, so nothing persists past this
+    # call.
+    overrides = [
+        name
+        for name, on in (
+            ("force_extract", force_extract),
+            ("ignore_cooldown", ignore_cooldown),
+        )
+        if on
+    ]
+    run = ResearchRun(
+        trigger=trigger,
+        status=RunStatus.RUNNING.value,
+        overrides=",".join(overrides) or None,
+    )
     session.add(run)
     await session.commit()
-    log.info("research run started", run_id=run.id, trigger=trigger, refresh=do_refresh)
+    log.info(
+        "research run started",
+        run_id=run.id,
+        trigger=trigger,
+        refresh=do_refresh,
+        overrides=overrides or None,
+    )
 
     try:
         accounts = await sync_accounts(session, rox)
@@ -353,12 +379,14 @@ async def run_research_cycle(
 
         await session.commit()
 
-        await _extract_signals(session, run)
+        await _extract_signals(session, run, force=force_extract)
 
         if create_opportunities:
             from app.services.opportunities import create_opportunities_for_run
 
-            created = await create_opportunities_for_run(session, run, notify=notify)
+            created = await create_opportunities_for_run(
+                session, run, notify=notify, ignore_cooldown=ignore_cooldown
+            )
             run.opportunities_created = len(created)
 
         run.status = (

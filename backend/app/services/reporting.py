@@ -572,6 +572,7 @@ async def run_health(
                 "id": r.id,
                 "trigger": r.trigger,
                 "status": r.status,
+                "overrides": r.overrides,
                 "started_at": r.started_at,
                 "finished_at": r.finished_at,
                 "duration_seconds": r.duration_seconds,

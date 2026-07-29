@@ -389,6 +389,8 @@ class ProspectingYieldOut(BaseModel):
 class RecentRunOut(BaseModel):
     id: str
     trigger: str
+    #: comma-joined per-run overrides; a forced run's numbers are not a trend
+    overrides: str | None = None
     status: RunStatus
     started_at: datetime
     finished_at: datetime | None = None

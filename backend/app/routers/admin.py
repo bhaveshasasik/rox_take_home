@@ -34,11 +34,33 @@ router = APIRouter(tags=["admin"])
 
 @router.post("/admin/research/run", response_model=RunTriggerOut)
 async def trigger_research(
-    notify: bool = True, session: AsyncSession = Depends(get_session)
+    notify: bool = True,
+    force_extract: bool = False,
+    ignore_cooldown: bool = False,
+    session: AsyncSession = Depends(get_session),
 ) -> RunTriggerOut:
-    """Run one research cycle now. Each opportunity notifies as it's created."""
+    """Run one research cycle now; qualifying opportunities notify in batch.
+
+    Per-run overrides, recorded on the run row and never persisted anywhere
+    else:
+    - `force_extract` bypasses the settled-row skip in extract_artifact, so
+      already-extracted artifacts re-extract. Known limit: it cannot bypass
+      the content-hash twin lookup — an artifact whose text matches another's
+      OK extraction copies rows instead of calling the model (~4% of cells),
+      so force does not strictly mean "call the model".
+    - `ignore_cooldown` skips the recently-decided cooldown for this run
+      only. The open-opportunity guard still applies; superseding is the
+      sanctioned way past it.
+    """
     async with RoxClient() as rox:
-        run = await run_research_cycle(session, rox, trigger="manual", notify=notify)
+        run = await run_research_cycle(
+            session,
+            rox,
+            trigger="manual",
+            notify=notify,
+            force_extract=force_extract,
+            ignore_cooldown=ignore_cooldown,
+        )
 
     notified = (
         await session.execute(
