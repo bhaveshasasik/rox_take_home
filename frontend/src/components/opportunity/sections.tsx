@@ -320,36 +320,48 @@ function readable(text: string, label?: string) {
 }
 
 /**
- * Absence signals quoting the same span, collapsed into one row.
+ * Signals quoting a byte-identical span, collapsed into one row.
  *
- * One "nothing was found" sentence legitimately becomes one absence per
- * category — that is the extraction prompt working as written, and the stored
- * signals must keep their own types because scoring counts them separately.
- * But this section renders only the evidence, so six typed absences over one
- * sentence printed as six byte-identical blocks.
+ * Two shapes produce this, and both render as the same sentence repeated:
+ *
+ * - Absences. One "nothing was found" statement legitimately becomes one
+ *   absence per category — the extraction prompt says so explicitly, and the
+ *   stored signals must keep their types because scoring counts them
+ *   separately. Cisco printed six identical blocks.
+ * - Positives. Here a shared span is a defect, not a design: the prompt tells
+ *   the model not to split one finding across two entries. Meta emitted one
+ *   headcount sentence as both `trigger_event` and `other`; Abbott emitted one
+ *   sentence across three scoring categories.
+ *
+ * They are grouped the same way because the reader's problem is identical, and
+ * because the alternative — showing a duplicate to signal that a duplicate
+ * exists — helps nobody. The underlying extraction defect is a scoring
+ * concern and is tracked separately; nothing here hides it, since every
+ * category the span was filed under is still named on the row.
  *
  * Grouping is display-only: every signal still arrives, still scores, and is
- * still reachable here. Only the row count drops.
+ * still reachable. Only the row count drops.
  *
- * Positives never group — two findings that happen to cite one sentence are
- * still two findings. Contested signals never group either: a contested signal
- * is one the model called positive over absence-shaped evidence, so folding it
- * into an absence block would assert the very thing the flag disputes.
+ * `is_absence` and `contested` are part of the key, never merged across. A
+ * contested signal is one the model called positive over absence-shaped
+ * evidence, so folding it in beside an undisputed finding would assert the
+ * very thing the flag disputes.
  */
 function groupRows(signals: ExtractedSignal[]): ExtractedSignal[][] {
   const rows: ExtractedSignal[][] = [];
-  const byEvidence = new Map<string, ExtractedSignal[]>();
+  const byKey = new Map<string, ExtractedSignal[]>();
 
   for (const signal of signals) {
     const span = (signal.evidence ?? "").trim();
     // An empty span carries nothing to group on — two signals whose evidence
     // failed validation are not thereby the same finding.
-    if (!signal.is_absence || signal.contested || !span) {
+    if (!span) {
       rows.push([signal]);
       continue;
     }
 
-    const existing = byEvidence.get(span);
+    const key = `${signal.is_absence ? 1 : 0}|${signal.contested ? 1 : 0}|${span}`;
+    const existing = byKey.get(key);
     if (existing) {
       existing.push(signal);
       continue;
@@ -357,7 +369,7 @@ function groupRows(signals: ExtractedSignal[]): ExtractedSignal[][] {
     // Pushed and indexed as the same array, so later members land in the row
     // already holding this span's position in the ranking.
     const created = [signal];
-    byEvidence.set(span, created);
+    byKey.set(key, created);
     rows.push(created);
   }
 
