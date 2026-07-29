@@ -97,9 +97,17 @@ async def retry(
 
 @router.post("/opportunities/{opportunity_id}/notify", response_model=NotificationOut)
 async def notify_now(
-    opportunity_id: str, session: AsyncSession = Depends(get_session)
+    opportunity_id: str,
+    force: bool = False,
+    session: AsyncSession = Depends(get_session),
 ) -> Notification:
-    """Re-send the notification for one opportunity."""
+    """Notify about one opportunity; re-sending requires `force=true`.
+
+    Without the guard this endpoint notified the same opportunity repeatedly,
+    inserting a fresh Notification row each time. A resend is recorded like
+    any send but never overwrites the original `notified_at` — decision
+    latency is measured from the first delivery.
+    """
     opp = (
         await session.execute(
             select(Opportunity)
@@ -109,6 +117,11 @@ async def notify_now(
     ).scalar_one_or_none()
     if opp is None:
         raise HTTPException(404, "opportunity not found")
+    if opp.notified_at is not None and not force:
+        raise HTTPException(
+            409,
+            "already notified — pass force=true to re-send deliberately",
+        )
     return await notify_opportunity(session, opp)
 
 

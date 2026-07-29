@@ -19,6 +19,7 @@ from app.models import (
     Account,
     Contact,
     DecisionType,
+    Notification,
     NotificationStatus,
     Opportunity,
     OpportunityStatus,
@@ -102,6 +103,37 @@ class TestNotifications:
         assert record.status == NotificationStatus.FAILED.value
         assert "channel down" in record.error
         assert opp.notified_at is None, "a failed send must not mark it notified"
+
+    async def test_renotify_requires_force(self, session, seeded, client):
+        """Option (a) from the checklist: refuse a repeat send unless forced,
+        and never move the original notified_at when forced."""
+        opp = (await session.execute(select(Opportunity))).scalars().first()
+        await notify_opportunity(session, opp, send=RecordingSend())
+        first_notified_at = opp.notified_at
+
+        refused = await client.post(f"/opportunities/{opp.id}/notify")
+        assert refused.status_code == 409
+        assert "force" in refused.json()["detail"]
+
+        from unittest.mock import AsyncMock, patch
+
+        with patch(
+            "app.services.notifications._send_email", AsyncMock(return_value=None)
+        ), patch(
+            "app.services.notifications._configured_recipient",
+            return_value="reviewer@example.com",
+        ):
+            forced = await client.post(f"/opportunities/{opp.id}/notify?force=true")
+
+        assert forced.status_code == 200
+        await session.refresh(opp)
+        assert opp.notified_at == first_notified_at, "a resend must not move notified_at"
+        records = (
+            await session.execute(
+                select(Notification).where(Notification.opportunity_id == opp.id)
+            )
+        ).scalars().all()
+        assert len(records) == 2, "the resend is recorded, distinguishably"
 
     async def test_notifications_are_listable(self, session, seeded, client):
         opp = (await session.execute(select(Opportunity))).scalars().first()

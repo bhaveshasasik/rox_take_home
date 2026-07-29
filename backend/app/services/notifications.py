@@ -200,7 +200,9 @@ async def notify_opportunity(
         await _attempt(record, send or (lambda m: _default_send(to, m)), message)
 
     if record.status == NotificationStatus.SENT.value:
-        opportunity.notified_at = utcnow()
+        # A resend must never overwrite the original delivery time —
+        # decision latency is measured from it.
+        opportunity.notified_at = opportunity.notified_at or utcnow()
         if opportunity.stage == Stage.OPPORTUNITY_CREATED.value:
             opportunity.stage = Stage.NOTIFIED.value
 
