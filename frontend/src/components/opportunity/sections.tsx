@@ -189,7 +189,7 @@ function MoreToggle({
  * substituting it here would present an unverifiable sentence in the place a
  * reader expects quoted source text, which is worse than an empty slot.
  */
-function Evidence({ text, label }: { text: string; label: string }) {
+function Evidence({ text, label }: { text: string; label?: string }) {
   const body = readable(text ?? "", label);
   if (!body) {
     return (
@@ -320,6 +320,51 @@ function readable(text: string, label?: string) {
 }
 
 /**
+ * Absence signals quoting the same span, collapsed into one row.
+ *
+ * One "nothing was found" sentence legitimately becomes one absence per
+ * category — that is the extraction prompt working as written, and the stored
+ * signals must keep their own types because scoring counts them separately.
+ * But this section renders only the evidence, so six typed absences over one
+ * sentence printed as six byte-identical blocks.
+ *
+ * Grouping is display-only: every signal still arrives, still scores, and is
+ * still reachable here. Only the row count drops.
+ *
+ * Positives never group — two findings that happen to cite one sentence are
+ * still two findings. Contested signals never group either: a contested signal
+ * is one the model called positive over absence-shaped evidence, so folding it
+ * into an absence block would assert the very thing the flag disputes.
+ */
+function groupRows(signals: ExtractedSignal[]): ExtractedSignal[][] {
+  const rows: ExtractedSignal[][] = [];
+  const byEvidence = new Map<string, ExtractedSignal[]>();
+
+  for (const signal of signals) {
+    const span = (signal.evidence ?? "").trim();
+    // An empty span carries nothing to group on — two signals whose evidence
+    // failed validation are not thereby the same finding.
+    if (!signal.is_absence || signal.contested || !span) {
+      rows.push([signal]);
+      continue;
+    }
+
+    const existing = byEvidence.get(span);
+    if (existing) {
+      existing.push(signal);
+      continue;
+    }
+    // Pushed and indexed as the same array, so later members land in the row
+    // already holding this span's position in the ranking.
+    const created = [signal];
+    byEvidence.set(span, created);
+    rows.push(created);
+  }
+
+  return rows;
+}
+
+/**
  * Extracted signals as labelled sections, each with the citations backing it.
  *
  * Falls back to the artifact's parsed signals, then to its narrative prose, for
@@ -351,59 +396,78 @@ export function ResearchSummary({
     const ranked = [...extractedSignals].sort(
       (a, b) => Number(a.signal_type === "other") - Number(b.signal_type === "other"),
     );
-    const shown = expanded ? ranked : ranked.slice(0, RESEARCH_PREVIEW);
+    const rows = groupRows(ranked);
+    const shown = expanded ? rows : rows.slice(0, RESEARCH_PREVIEW);
 
     return (
       <section className="px-6 py-5">
         <SectionLabel>Research summary</SectionLabel>
         <div className="space-y-5">
-          {shown.map((signal) => (
-            <article key={signal.id} className="border-border border-b pb-5 last:border-0 last:pb-0">
-              <div className="mb-1.5 flex items-center justify-between gap-3">
-                <span className="flex min-w-0 items-center gap-1.5">
-                  <span className="truncate text-[12px] font-medium">{signal.label}</span>
-                  {signal.is_absence && (
-                    <span className="text-muted-foreground shrink-0 text-[10px]">
-                      nothing found
+          {shown.map((row) => {
+            // Every member of a group quotes the same span, and sources are
+            // resolved from that span, so the lead's are the whole row's.
+            const [lead] = row;
+            const sources = lead.sources ?? [];
+            const label = row.map((signal) => signal.label).join(" · ");
+
+            return (
+              <article key={lead.id} className="border-border border-b pb-5 last:border-0 last:pb-0">
+                <div className="mb-1.5 flex items-center justify-between gap-3">
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    {/* Six categories over one span outruns the column, so the
+                        full list stays reachable on hover. */}
+                    <span className="truncate text-[12px] font-medium" title={label}>
+                      {label}
                     </span>
-                  )}
-                  {signal.contested && (
-                    <span className="text-age-overdue shrink-0 text-[10px]">disputed</span>
-                  )}
-                  {looksMalformed(signal.evidence) && (
-                    <span
-                      className="text-age-overdue shrink-0 text-[10px]"
-                      title="The source research contains markup or structured-data fragments. Read this evidence with care."
-                    >
-                      malformed source
-                    </span>
-                  )}
-                </span>
-                <div className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[10px]">
-                  <SourceLinks sources={signal.sources ?? []} />
-                  {fetchedAt && (
-                    <>
-                      {(signal.sources ?? []).some((s) => s.kind === "web") && (
-                        <span className="text-border">·</span>
-                      )}
-                      <span className="font-mono" title={absoluteTime(fetchedAt)}>
-                        {formatAge(fetchedAt)} ago
+                    {lead.is_absence && (
+                      <span className="text-muted-foreground shrink-0 text-[10px]">
+                        nothing found
                       </span>
-                    </>
-                  )}
+                    )}
+                    {lead.contested && (
+                      <span className="text-age-overdue shrink-0 text-[10px]">disputed</span>
+                    )}
+                    {looksMalformed(lead.evidence) && (
+                      <span
+                        className="text-age-overdue shrink-0 text-[10px]"
+                        title="The source research contains markup or structured-data fragments. Read this evidence with care."
+                      >
+                        malformed source
+                      </span>
+                    )}
+                  </span>
+                  <div className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[10px]">
+                    <SourceLinks sources={sources} />
+                    {fetchedAt && (
+                      <>
+                        {sources.some((s) => s.kind === "web") && (
+                          <span className="text-border">·</span>
+                        )}
+                        <span className="font-mono" title={absoluteTime(fetchedAt)}>
+                          {formatAge(fetchedAt)} ago
+                        </span>
+                      </>
+                    )}
+                  </div>
                 </div>
-              </div>
-              {/* The verbatim span only. The per-signal rationale is generated
-                  prose and cannot be checked against the source, so it is not
-                  shown here — evidence can be, and is. */}
-              <Evidence text={signal.evidence} label={signal.label} />
-            </article>
-          ))}
+                {/* The verbatim span only. The per-signal rationale is generated
+                    prose and cannot be checked against the source, so it is not
+                    shown here — evidence can be, and is. */}
+                {/* A grouped row passes no label: `readable` strips a leading
+                    category prefix, and only the lead's would ever match. */}
+                <Evidence
+                  text={lead.evidence}
+                  label={row.length === 1 ? lead.label : undefined}
+                />
+              </article>
+            );
+          })}
         </div>
         <MoreToggle
-          hidden={extractedSignals.length - shown.length}
+          hidden={rows.length - shown.length}
           expanded={expanded}
           onToggle={() => setExpanded((v) => !v)}
+          noun="finding"
         />
         {columnName && (
           <p className="text-muted-foreground/70 mt-4 text-[10px]">Source: {columnName}</p>
