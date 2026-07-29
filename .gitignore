@@ -1,4 +1,5 @@
-.env
+# macOS
+.DS_Store
 
 # SQLite databases and any snapshot/backup variants
 # (*.db.* covers rox_pipeline.db.bak, rox_pipeline.db.pre-rescore, etc.)
@@ -8,9 +9,7 @@
 *.db-wal
 *.db-shm
 
-__pycache__/
-*.pyc
-.venv/
-.pytest_cache/
-.ruff_cache/
-.DS_Store
+# env
+.env
+.env.*
+!.env.example
