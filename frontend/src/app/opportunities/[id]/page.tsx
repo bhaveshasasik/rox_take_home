@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 
+import { DetailSkeleton } from "@/components/opportunity/detail-skeleton";
 import { OpportunityDetailView } from "@/components/opportunity/detail-view";
 
 export const metadata: Metadata = {
@@ -19,7 +21,10 @@ export default async function OpportunityPage({
 
   return (
     <main className="flex min-h-full flex-1 flex-col">
-      <OpportunityDetailView id={id} />
+      {/* `?tab=` is read via `useSearchParams` — see the note on the list page. */}
+      <Suspense fallback={<DetailSkeleton />}>
+        <OpportunityDetailView id={id} />
+      </Suspense>
     </main>
   );
 }

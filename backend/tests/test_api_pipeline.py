@@ -152,7 +152,7 @@ class TestBatchNotification:
         assert low.notified_at is None, "lowest score should stay queued below the batch size"
 
     async def test_email_lists_each_account_without_a_score(self, session, seeded):
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         opps = (await session.execute(select(Opportunity))).scalars().all()
         sent: dict[str, str] = {}
@@ -715,7 +715,7 @@ class TestReporting:
     async def test_conversion_out_of_an_empty_step_is_undefined(
         self, session, seeded, client
     ):
-        """Accepting without notifying must not read as a 0% conversion."""
+        """Deciding without notifying must not read as a 0% conversion."""
         opps = (
             (await session.execute(select(Opportunity).order_by(Opportunity.id)))
             .scalars()
@@ -727,8 +727,63 @@ class TestReporting:
 
         steps = {s["stage"]: s for s in (await client.get("/reporting/funnel")).json()["steps"]}
         assert steps["notified"]["count"] == 0
+        # `reviewed` is the step that now follows the empty one
+        assert steps["reviewed"]["count"] == 1
+        assert steps["reviewed"]["pct_of_previous"] is None
+
+    async def test_reviewed_counts_decisions_not_notifications(
+        self, session, seeded, client
+    ):
+        """`notified` means the reviewer was emailed, not that anyone looked —
+        using it as the accept denominator overstates review throughput."""
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        for opp in opps:
+            await notify_opportunity(session, opp, send=RecordingSend())
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+        await client.post(
+            f"/opportunities/{opps[1].id}/decision", json={"decision": "reject"}
+        )
+
+        steps = {s["stage"]: s for s in (await client.get("/reporting/funnel")).json()["steps"]}
+        assert steps["notified"]["count"] == 3
+        assert steps["reviewed"]["count"] == 2, "accepted + rejected, not notified"
         assert steps["accepted"]["count"] == 1
-        assert steps["accepted"]["pct_of_previous"] is None
+
+    async def test_prospected_counts_contacts_not_sequences(
+        self, session, seeded, client
+    ):
+        """A failed prospecting run still writes a Sequence row, so counting
+        sequences would credit accounts where Rox returned nobody."""
+        from app.models import Sequence, SequenceStatus
+
+        opps = (
+            (await session.execute(select(Opportunity).order_by(Opportunity.id)))
+            .scalars()
+            .all()
+        )
+        await client.post(
+            f"/opportunities/{opps[0].id}/decision", json={"decision": "accept"}
+        )
+        # a sequence that found no one
+        session.add(
+            Sequence(
+                opportunity_id=opps[1].id,
+                account_id=opps[1].account_id,
+                name="empty",
+                status=SequenceStatus.FAILED.value,
+                error="no contacts found",
+            )
+        )
+        await session.commit()
+
+        steps = {s["stage"]: s for s in (await client.get("/reporting/funnel")).json()["steps"]}
+        assert steps["prospected"]["count"] == 0, "no contacts were actually found"
 
 
 class TestReportingWindows:

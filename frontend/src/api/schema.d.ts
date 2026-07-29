@@ -153,6 +153,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/opportunities/{opportunity_id}/brief": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Write Opportunity Brief
+         * @description Elaborate this opportunity's extracted signals into a brief.
+         *
+         *     POST rather than GET because it costs an LLM call. Reads the stored
+         *     signals rather than Rox's raw narrative, so every claim traces back to a
+         *     typed signal, a verbatim evidence span, and a whitelisted source.
+         */
+        post: operations["write_opportunity_brief_opportunities__opportunity_id__brief_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/opportunities/{opportunity_id}/decision": {
         parameters: {
             query?: never;
@@ -500,6 +524,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/signals/extract": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Extract Signals
+         * @description Run structured extraction over stored research artifacts.
+         *
+         *     Deliberately manual. Extraction does not run inside the research cycle
+         *     yet, so this is the only thing that populates the signal tables — which
+         *     keeps the LLM cost and the output itself reviewable before either touches
+         *     the pipeline. Idempotent: artifacts already extracted at the current
+         *     schema version are skipped unless `force` is set.
+         */
+        post: operations["extract_signals_admin_signals_extract_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/signals/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Signals Health
+         * @description Extraction coverage, failure rate, and the signal-type distribution.
+         *
+         *     The distribution is the one to watch: it is what
+         *     `/reporting/signal-performance` will group on, and a collapse into
+         *     `other` means the categories stopped matching what Rox returns.
+         */
+        get: operations["signals_health_admin_signals_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/rox/me": {
         parameters: {
             query?: never;
@@ -541,6 +615,22 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AccountBriefOut */
+        AccountBriefOut: {
+            /** Headline */
+            headline: string;
+            /** Rationale */
+            rationale: string;
+            /** Why Now */
+            why_now: string;
+            /** Sources */
+            sources?: components["schemas"]["SourceRefOut"][];
+            /**
+             * Signal Count
+             * @default 0
+             */
+            signal_count: number;
+        };
         /** AccountCoverageOut */
         AccountCoverageOut: {
             /** Total Accounts */
@@ -678,6 +768,86 @@ export interface components {
          * @enum {string}
          */
         EnrollmentStatus: "pending" | "active" | "replied" | "bounced" | "completed";
+        /** ExtractedSignalOut */
+        ExtractedSignalOut: {
+            /** Id */
+            id: string;
+            /** Signal Type */
+            signal_type: string;
+            /** Label */
+            label: string;
+            /** Confidence */
+            confidence: number;
+            /** Is Absence */
+            is_absence: boolean;
+            /**
+             * Contested
+             * @default false
+             */
+            contested: boolean;
+            /** Rationale */
+            rationale: string;
+            /** Evidence */
+            evidence: string;
+            /** Sources */
+            sources?: components["schemas"]["SourceRefOut"][];
+        };
+        /** ExtractionHealthOut */
+        ExtractionHealthOut: {
+            /** Artifacts */
+            artifacts: number;
+            /** Extractions */
+            extractions: number;
+            /** By Status */
+            by_status?: {
+                [key: string]: number;
+            };
+            /** By Schema Version */
+            by_schema_version?: {
+                [key: string]: number;
+            };
+            /** By Signal Type */
+            by_signal_type?: {
+                [key: string]: number;
+            };
+            /**
+             * Failure Rate
+             * @default 0
+             */
+            failure_rate: number;
+            /**
+             * Unextracted
+             * @default 0
+             */
+            unextracted: number;
+            /**
+             * Signals Per 1K Chars
+             * @default 0
+             */
+            signals_per_1k_chars: number;
+            /**
+             * Low Yield
+             * @default 0
+             */
+            low_yield: number;
+            /** Low Yield Accounts */
+            low_yield_accounts?: string[];
+        };
+        /** ExtractionRunOut */
+        ExtractionRunOut: {
+            /** Examined */
+            examined: number;
+            /** Extracted */
+            extracted: number;
+            /** Reused */
+            reused: number;
+            /** Failed */
+            failed: number;
+            /** Skipped */
+            skipped: number;
+            /** Signals */
+            signals: number;
+        };
         /** FunnelOut */
         FunnelOut: {
             /** Steps */
@@ -814,6 +984,11 @@ export interface components {
              * @default false
              */
             has_sequence: boolean;
+            /** Extracted Signals */
+            extracted_signals?: components["schemas"]["ExtractedSignalOut"][];
+            score_breakdown?: components["schemas"]["ScoreBreakdownOut"] | null;
+            /** Sources */
+            sources?: components["schemas"]["SourceRefOut"][];
         };
         /** OpportunityListOut */
         OpportunityListOut: {
@@ -952,6 +1127,8 @@ export interface components {
             accounts_scanned: number;
             /** Cells Fetched */
             cells_fetched: number;
+            /** Cells Unscoreable */
+            cells_unscoreable: number;
             /** Opportunities Created */
             opportunities_created: number;
         };
@@ -1037,6 +1214,8 @@ export interface components {
             cells_fetched: number;
             /** Cells Timed Out */
             cells_timed_out: number;
+            /** Cells Unscoreable */
+            cells_unscoreable: number;
             /** Artifacts Created */
             artifacts_created: number;
             /** Opportunities Created */
@@ -1084,6 +1263,8 @@ export interface components {
             success_rate: number;
             /** Total Cells Fetched */
             total_cells_fetched: number;
+            /** Total Cells Unscoreable */
+            total_cells_unscoreable: number;
             /** Recent Runs */
             recent_runs: components["schemas"]["RecentRunOut"][];
         };
@@ -1116,6 +1297,13 @@ export interface components {
             /** Acceptance Rate */
             acceptance_rate: number;
         };
+        /** ScoreBreakdownOut */
+        ScoreBreakdownOut: {
+            /** Total */
+            total: number;
+            /** Factors */
+            factors?: components["schemas"]["ScoreFactorOut"][];
+        };
         /** ScoreCalibrationOut */
         ScoreCalibrationOut: {
             /** Total Decided */
@@ -1124,6 +1312,15 @@ export interface components {
             buckets?: number | null;
             /** Bands */
             bands: components["schemas"]["ScoreBandOut"][];
+        };
+        /** ScoreFactorOut */
+        ScoreFactorOut: {
+            /** Name */
+            name: string;
+            /** Points */
+            points: number;
+            /** Detail */
+            detail: string;
         };
         /** SequenceOut */
         SequenceOut: {
@@ -1169,10 +1366,21 @@ export interface components {
             acceptance_rate: number;
         };
         /**
+         * SourceKind
+         * @enum {string}
+         */
+        SourceKind: "web" | "rox";
+        /** SourceRefOut */
+        SourceRefOut: {
+            /** Url */
+            url: string;
+            kind: components["schemas"]["SourceKind"];
+        };
+        /**
          * Stage
          * @enum {string}
          */
-        Stage: "researched" | "opportunity_created" | "notified" | "accepted" | "rejected" | "prospected" | "sequenced" | "outreach_sent";
+        Stage: "researched" | "opportunity_created" | "notified" | "reviewed" | "accepted" | "rejected" | "prospected" | "sequenced" | "outreach_sent";
         /** TaskTypeTelemetryOut */
         TaskTypeTelemetryOut: {
             /** Task Type */
@@ -1424,6 +1632,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["OpportunityDetailOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    write_opportunity_brief_opportunities__opportunity_id__brief_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                opportunity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountBriefOut"];
                 };
             };
             /** @description Validation Error */
@@ -2039,6 +2278,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DigestResultOut"];
+                };
+            };
+        };
+    };
+    extract_signals_admin_signals_extract_post: {
+        parameters: {
+            query?: {
+                run_id?: string | null;
+                limit?: number | null;
+                force?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractionRunOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    signals_health_admin_signals_health_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractionHealthOut"];
                 };
             };
         };

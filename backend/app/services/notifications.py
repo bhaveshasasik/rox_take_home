@@ -30,19 +30,24 @@ from app.models import (
     utcnow,
 )
 from app.services.rationale import write_notification_summary
+from app.signals.schema import signal_label as _signal_label
 
 log = get_logger(__name__)
 
 
 def signal_label(signal_type: str) -> str:
-    """Human-readable label for a signal_type slug.
+    """Human-readable label for a signal_type.
 
-    signal_type is derived by slugifying whatever category label Rox's own
-    research emits ("Growth / Expansion" -> "growth_expansion") — an open
-    vocabulary, not a fixed set — so there's no fixed dict to map from; just
-    reverse the slugging.
+    Now a lookup against the fixed `SignalType` vocabulary. The old open
+    vocabulary — slugified from whatever category label Rox happened to emit —
+    produced `trigger_event` and `trigger_events` as separate values plus four
+    rows where an entire sentence became the slug.
+
+    The title-cased fallback remains for rows written before the backfill: a
+    label is display text, and rendering a legacy value badly beats rendering
+    it blank.
     """
-    return (signal_type or "").replace("_", " ").title()
+    return _signal_label(signal_type)
 
 
 @dataclass
@@ -222,7 +227,11 @@ async def retry_notification(
             record.error = "no email channel configured"
             await session.commit()
             return record
-        send = lambda m: _default_send(to, m)
+
+        # a def rather than a lambda: it is a coroutine function, and binding
+        # `to` here keeps the call site identical to a caller-supplied sender
+        async def send(m: OpportunityMessage) -> dict:
+            return await _default_send(to, m)
 
     opportunity = record.opportunity
     message = await build_message(

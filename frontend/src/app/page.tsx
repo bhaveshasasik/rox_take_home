@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 
 import { PipelineView } from "@/components/pipeline/pipeline-view";
+import { TableSkeleton } from "@/components/pipeline/table-skeleton";
 
 export const metadata: Metadata = {
   title: "Pipeline · Rox",
@@ -15,7 +17,12 @@ export const metadata: Metadata = {
 export default function PipelinePage() {
   return (
     <main className="flex min-h-full flex-1 flex-col">
-      <PipelineView />
+      {/* Required: `PipelineView` reads the filters from `useSearchParams`,
+          which would otherwise force the whole tree above it to be
+          client-rendered instead of prerendered. */}
+      <Suspense fallback={<TableSkeleton />}>
+        <PipelineView />
+      </Suspense>
     </main>
   );
 }

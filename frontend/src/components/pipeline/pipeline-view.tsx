@@ -1,6 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useMemo } from "react";
+
+import { DEFAULT_QUERY_STRING, parseFilters, serializeFilters } from "@/lib/url-state";
 
 import { EmptyState } from "./empty-state";
 import { ErrorState } from "./error-state";
@@ -15,12 +18,30 @@ import {
 } from "./use-opportunities";
 
 export function PipelineView() {
-  const [filters, setFilters] = useState<OpportunityFilters>(DEFAULT_FILTERS);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const search = searchParams.toString();
+  // A bare `/` means "first visit", not "no filters" — show the default queue
+  // immediately and normalise the URL to match, so the next interaction has
+  // something explicit to diff against.
+  const isFirstVisit = search === "";
+  const filters = useMemo(
+    () => (isFirstVisit ? DEFAULT_FILTERS : parseFilters(new URLSearchParams(search))),
+    [isFirstVisit, search],
+  );
+
+  useEffect(() => {
+    if (isFirstVisit) router.replace(`/?${DEFAULT_QUERY_STRING}`, { scroll: false });
+  }, [isFirstVisit, router]);
+
   const query = useOpportunities(filters);
   const stats = usePipelineStats();
 
+  // `push`, not `replace`: filter changes are discrete user actions, so the
+  // back button should undo them.
   const update = (next: Partial<OpportunityFilters>) =>
-    setFilters((current) => ({ ...current, ...next }));
+    router.push(`/?${serializeFilters({ ...filters, ...next })}`, { scroll: false });
 
   // Stable identity: `?? []` would allocate a fresh array every render, which
   // defeats the memo below and re-renders the table on every parent render.
@@ -88,7 +109,7 @@ export function PipelineView() {
       ) : query.isPending ? (
         <TableSkeleton />
       ) : rows.length === 0 ? (
-        <EmptyState filtered={isFiltered} onClearFilters={() => setFilters({ limit })} />
+        <EmptyState filtered={isFiltered} onClearFilters={() => router.push(`/?${serializeFilters({ limit })}`, { scroll: false })} />
       ) : (
         <PipelineTable
           rows={rows}

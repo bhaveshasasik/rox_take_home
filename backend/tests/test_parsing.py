@@ -7,7 +7,6 @@ captured from the org on 2026-07-27: a JSON array of
 found. Cells are also stored capped at ~300 chars with a trailing "...", so a
 multi-item array is frequently truncated mid-object."""
 
-import pytest
 
 from app.services.parsing import parse_cell, parse_signals
 
@@ -112,10 +111,10 @@ class TestParseSignals:
     def test_strongest_signal_first(self):
         """The headline score is the highest signal, so it must lead."""
         signals = parse_signals(
-            '[{"signal":"weak","evidence":"e","score":2},'
-            '{"signal":"strong","evidence":"e","score":9}]'
+            '[{"signal":"Champion & Engagement","evidence":"e","score":2},'
+            '{"signal":"Growth / Expansion","evidence":"e","score":9}]'
         )
-        assert [s.signal for s in signals] == ["strong", "weak"]
+        assert [s.signal for s in signals] == ["Growth / Expansion", "Champion & Engagement"]
         assert signals[0].score == 90
 
     def test_headline_score_matches_the_top_signal(self):
@@ -149,7 +148,7 @@ class TestParseSignals:
 
     def test_missing_score_is_none_not_zero(self):
         """A missing score is unknown, not a zero-strength signal."""
-        signals = parse_signals('[{"signal":"a","evidence":"e"}]')
+        signals = parse_signals('[{"signal":"Growth / Expansion","evidence":"e"}]')
         assert signals[0].score is None
 
 
@@ -257,3 +256,149 @@ class TestNarrativeSignals:
             "Growth / Expansion",
             "Trigger Events",
         ]
+
+
+class TestMidSentenceAbsence:
+    """A negation can keep a positive-sounding label and state the absence in
+    the body — "Internal CRM communications returned no results"."""
+
+    def test_absence_stated_mid_sentence_scores_zero(self):
+        cell = (
+            "Evidence\n\n"
+            "- Champion & Engagement — internal CRM communications: returned no "
+            "results for relevance searches across the account.\n"
+            "  - Confidence: 8\n"
+        )
+        assert parse_signals(cell)[0].score == 0
+
+    def test_a_positive_finding_is_not_zeroed_by_a_buried_phrase(self):
+        """Only the opening clause decides polarity; scanning the whole body
+        would zero genuinely positive findings that mention an absence later."""
+        cell = (
+            "Evidence\n\n"
+            "- Champion & Engagement: Presence of a C-level contact in CRM indicates "
+            "an executive relationship, though there are no meetings logged this "
+            "quarter and no internal notes beyond the initial record.\n"
+            "  - Confidence: 4\n"
+        )
+        assert parse_signals(cell)[0].score == 40
+
+
+class TestCategoryGate:
+    """The column's prompt names six categories to score. Rox pads well past
+    that brief, and because `Confidence` measures certainty rather than
+    strength, a maximum-confidence firmographic outscored every real signal."""
+
+    FIRMOGRAPHIC = (
+        "Evidence\n\n"
+        "- Headquarters: Palo Alto, California, per the company website.\n"
+        "  - Confidence: 10\n\n"
+        "- Growth / Expansion: Deliveries up 14% year over year (Q2 2026).\n"
+        "  - Confidence: 6\n"
+    )
+
+    def test_out_of_category_signals_are_dismissed(self):
+        signals = parse_signals(self.FIRMOGRAPHIC)
+        assert [s.signal for s in signals] == ["Growth / Expansion"]
+
+    def test_the_score_comes_from_a_real_signal_not_a_firmographic(self):
+        """Tesla scored 100 on "Headquarters" before this gate existed."""
+        assert parse_cell(self.FIRMOGRAPHIC).score == 60
+
+    def test_all_six_categories_are_recognised(self):
+        for label in (
+            "Growth / Expansion",
+            "Buying Intent (meetings cadence increase)",
+            "Trigger Events",
+            "Champion & Engagement",
+            "Competitive Displacement",
+            "Whitespace / Cross-Sell",
+        ):
+            cell = f"Evidence\n\n- {label}: something happened.\n  - Confidence: 7\n"
+            assert parse_signals(cell), f"{label!r} should be scoreable"
+
+    def test_a_cell_with_only_firmographics_yields_nothing(self):
+        cell = (
+            "Evidence\n\n"
+            "- Official website: example.com\n  - Confidence: 10\n\n"
+            "- Headcount: 97,000 employees.\n  - Confidence: 9\n"
+        )
+        assert parse_signals(cell) == []
+        assert parse_cell(cell).score is None
+
+
+class TestInlineConfidence:
+    """Rox often writes the confidence at the end of the claim rather than as
+    a sub-bullet, where it leaks into the rendered evidence and rationale."""
+
+    INLINE = (
+        "Supporting evidence\n"
+        "- Growth / Expansion: deliveries up 14% year over year. Confidence: 9.\n"
+        "- Buying Intent: no meetings or notes in the workspace. Confidence: 9.\n"
+    )
+
+    def test_confidence_is_read_from_the_inline_form(self):
+        assert parse_signals(self.INLINE)[0].score == 90
+
+    def test_confidence_is_stripped_from_the_evidence(self):
+        top = parse_signals(self.INLINE)[0]
+        assert top.evidence == "deliveries up 14% year over year"
+        assert "onfidence" not in top.evidence
+
+    def test_rationale_does_not_repeat_identical_evidence(self):
+        """When every category comes back empty the same sentence repeats once
+        per category, which made the rationale unreadable."""
+        empty = "".join(
+            f"- {cat}: none found in available internal data. Confidence: 9.\n"
+            for cat in ("Growth / Expansion", "Buying Intent", "Trigger Events")
+        )
+        rationale = parse_cell("Supporting evidence\n" + empty).rationale
+        assert rationale.count("none found in available internal data") == 1
+
+
+class TestBulletsWhoseOnlyColonIsTheConfidence:
+    """When the inline confidence is the only `: ` on the line, splitting
+    label from evidence before stripping it left the evidence as a bare digit."""
+
+    CELL = (
+        "Supporting evidence\n"
+        "- Full-year 2026 outlook cited targeting ~7% net revenue growth. Confidence: 7\n"
+    )
+
+    def test_evidence_is_the_claim_not_the_confidence_digit(self):
+        top = parse_signals(self.CELL)[0]
+        assert top.evidence != "7"
+        assert "net revenue growth" in top.evidence
+
+    def test_the_score_still_comes_from_that_confidence(self):
+        assert parse_signals(self.CELL)[0].score == 70
+
+    def test_rationale_prefers_what_was_found_over_what_was_not(self):
+        """An absence beside a real signal is noise in the rationale."""
+        cell = (
+            "Supporting evidence\n"
+            "- Growth / Expansion: deliveries up 14%. Confidence: 8\n"
+            "- Buying Intent: no meetings or notes found. Confidence: 9\n"
+        )
+        rationale = parse_cell(cell).rationale
+        assert "deliveries up 14%" in rationale
+        assert "no meetings" not in rationale
+
+    def test_absences_are_used_when_nothing_positive_was_found(self):
+        cell = (
+            "Supporting evidence\n"
+            "- Growth / Expansion: no evidence found. Confidence: 9\n"
+        )
+        assert "no evidence found" in parse_cell(cell).rationale
+
+    def test_parenthesised_and_fractional_confidence_are_stripped(self):
+        """Rox writes it three ways: trailing, "8/10", and "(High confidence: 8)"."""
+        for line, expected in [
+            ("- Trigger Events: Strategic M&A and partnerships (High confidence: 8)",
+             "Strategic M&A and partnerships"),
+            ("- Growth / Expansion: no revenue signals present. Confidence: 8/10",
+             "no revenue signals present"),
+        ]:
+            top = parse_signals("Supporting evidence\n" + line + "\n")[0]
+            assert top.evidence == expected, top.evidence
+            assert "onfidence" not in top.evidence

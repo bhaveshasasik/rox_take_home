@@ -22,6 +22,12 @@ export function PipelineTable({
   sortState: SortState;
   onSortChange: (next: SortState) => void;
 }) {
+  // TanStack Table returns functions the React Compiler cannot safely memoize,
+  // so it skips this component either way. Opting out explicitly makes that
+  // intentional rather than inferred — and keeps the build output honest.
+  "use no memo";
+
+  // eslint-disable-next-line react-hooks/incompatible-library -- opted out above
   const table = useReactTable({
     data: rows,
     columns: pipelineColumns,

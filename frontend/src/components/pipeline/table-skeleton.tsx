@@ -1,3 +1,9 @@
+// Must be a client component: it derives its columns from `pipelineColumns`,
+// which lives in a "use client" module. Imported into a server component that
+// value arrives as a client-reference proxy, not an array, and rendering it
+// fails at prerender with "pipelineColumns.map is not a function".
+"use client";
+
 import { Skeleton } from "@/components/ui/skeleton";
 
 import { pipelineColumns, type PipelineColumnMeta } from "./columns";

@@ -42,7 +42,6 @@ from app.models import (
     Contact,
     Decision,
     DecisionType,
-    Notification,
     Opportunity,
     OpportunityStatus,
     OutreachEmail,
@@ -61,6 +60,7 @@ from app.services.notifications import signal_label
 _FUNNEL_STAGES = [
     Stage.OPPORTUNITY_CREATED,
     Stage.NOTIFIED,
+    Stage.REVIEWED,
     Stage.ACCEPTED,
     Stage.PROSPECTED,
     Stage.SEQUENCED,
@@ -200,7 +200,23 @@ async def funnel(
             query = query.where(clause)
         return query
 
-    prospected = (await session.execute(_sequence_count())).scalar_one()
+    # Opportunities a human actually decided. `notified` only means the
+    # reviewer was emailed — on live data 15 notified vs 5 decided, so using
+    # notified as the denominator overstates review throughput threefold.
+    reviewed = await _count(
+        session, Opportunity.status != OpportunityStatus.NEW.value, *window
+    )
+
+    # Contacts found, not sequences created: `run_prospecting` writes a FAILED
+    # sequence even when Rox returns nobody, so counting sequences would credit
+    # accounts where prospecting found no one.
+    prospected_query = select(func.count(func.distinct(Contact.opportunity_id))).join(
+        Opportunity, Contact.opportunity_id == Opportunity.id
+    )
+    for clause in window:
+        prospected_query = prospected_query.where(clause)
+    prospected = (await session.execute(prospected_query)).scalar_one()
+
     sequenced = (
         await session.execute(
             _sequence_count(Sequence.status == SequenceStatus.ACTIVE.value)
@@ -210,6 +226,7 @@ async def funnel(
     counts = {
         Stage.OPPORTUNITY_CREATED: total,
         Stage.NOTIFIED: notified,
+        Stage.REVIEWED: reviewed,
         Stage.ACCEPTED: accepted,
         Stage.PROSPECTED: prospected,
         Stage.SEQUENCED: sequenced,
@@ -533,6 +550,9 @@ async def run_health(
         "runs_considered": len(runs),
         "success_rate": _pct(succeeded, len(runs)),
         "total_cells_fetched": sum(r.cells_fetched for r in runs),
+        # a rising share here means research is arriving in a shape the parser
+        # no longer understands
+        "total_cells_unscoreable": sum(r.cells_unscoreable for r in runs),
         "recent_runs": [
             {
                 "id": r.id,
@@ -543,6 +563,7 @@ async def run_health(
                 "duration_seconds": r.duration_seconds,
                 "accounts_scanned": r.accounts_scanned,
                 "cells_fetched": r.cells_fetched,
+                "cells_unscoreable": r.cells_unscoreable,
                 "opportunities_created": r.opportunities_created,
             }
             for r in runs

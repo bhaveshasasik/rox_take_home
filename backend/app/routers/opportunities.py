@@ -37,6 +37,14 @@ from app.services.decisions import AlreadyDecidedError, record_decision
 from app.services.notifications import signal_label
 from app.services.parsing import parse_cell, parse_signals
 from app.services.prospecting import run_prospecting
+from app.signals.schema import AccountBriefOut
+from app.signals.service import (
+    breakdown_for_opportunity,
+    brief_for_opportunity,
+    scored_for_artifact,
+    signals_for_opportunity,
+    sources_for_opportunity,
+)
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/opportunities", tags=["opportunities"])
@@ -180,6 +188,54 @@ async def get_stats(
     )
 
 
+async def _artifact_out(
+    session: AsyncSession, artifact: ResearchArtifact
+) -> ResearchArtifactOut:
+    """One artifact's research, from structured signals where they exist.
+
+    Falls back to `parse_signals` / `parse_cell` for artifacts that have not
+    been extracted. The raw cell is not renderable on its own — Rox truncates
+    long cells mid-array, so `cell_value` is frequently invalid JSON — which is
+    why this shape crosses the wire rather than the client parsing it.
+    """
+    extracted = await scored_for_artifact(session, artifact.id)
+    if extracted is not None:
+        _scored, signals = extracted
+        return ResearchArtifactOut(
+            id=artifact.id,
+            column_key=artifact.column.key if artifact.column else None,
+            column_name=artifact.column.name if artifact.column else None,
+            cell_value=artifact.cell_value,
+            signals=[
+                ResearchSignalOut(
+                    signal=signal_label(s.signal_type),
+                    evidence=s.evidence,
+                    # 0-10 confidence on the same 0-100 scale the old path used
+                    score=0 if (s.is_absence or s.contested) else s.confidence * 10,
+                )
+                for s in signals
+            ],
+            narrative="\n\n".join(
+                s.rationale for s in signals if s.rationale and not s.is_absence
+            )
+            or None,
+            fetched_at=artifact.fetched_at,
+        )
+
+    return ResearchArtifactOut(
+        id=artifact.id,
+        column_key=artifact.column.key if artifact.column else None,
+        column_name=artifact.column.name if artifact.column else None,
+        cell_value=artifact.cell_value,
+        signals=[
+            ResearchSignalOut(signal=s.signal, evidence=s.evidence, score=s.score)
+            for s in parse_signals(artifact.cell_value)
+        ],
+        narrative=parse_cell(artifact.cell_value).rationale,
+        fetched_at=artifact.fetched_at,
+    )
+
+
 @router.get("/{opportunity_id}", response_model=OpportunityDetailOut)
 async def get_opportunity(
     opportunity_id: str, session: AsyncSession = Depends(get_session)
@@ -224,25 +280,7 @@ async def get_opportunity(
 
     detail = OpportunityDetailOut.model_validate(_to_out(opp).model_dump())
     detail.research = [
-        ResearchArtifactOut(
-            id=a.id,
-            column_key=a.column.key if a.column else None,
-            column_name=a.column.name if a.column else None,
-            cell_value=a.cell_value,
-            # parsed here rather than by the client: the raw cell is routinely
-            # truncated mid-array and is not valid JSON
-            signals=[
-                ResearchSignalOut(
-                    signal=s.signal, evidence=s.evidence, score=s.score
-                )
-                for s in parse_signals(a.cell_value)
-            ],
-            # Rox returns narrative prose for most cells; this is the readable
-            # form of whichever shape came back.
-            narrative=parse_cell(a.cell_value).rationale,
-            fetched_at=a.fetched_at,
-        )
-        for a in artifacts
+        await _artifact_out(session, a) for a in artifacts
     ]
     # Validate rather than assigning the ORM rows straight in: pydantic does
     # not validate on assignment, so the raw model objects would sit in these
@@ -255,7 +293,34 @@ async def get_opportunity(
         NotificationOut.model_validate(n) for n in opp.notifications
     ]
     detail.has_sequence = has_sequence
+
+    # Structured signals, when this opportunity's research has been extracted.
+    # Reads stored rows only — no LLM call on a GET. Empty until extraction
+    # runs, which is why the regex-parsed `research[].signals` above stays.
+    detail.extracted_signals = await signals_for_opportunity(session, opportunity_id)
+    detail.score_breakdown = await breakdown_for_opportunity(session, opportunity_id)
+    detail.sources = await sources_for_opportunity(session, opportunity_id)
     return detail
+
+
+@router.post("/{opportunity_id}/brief", response_model=AccountBriefOut)
+async def write_opportunity_brief(
+    opportunity_id: str, session: AsyncSession = Depends(get_session)
+) -> AccountBriefOut:
+    """Elaborate this opportunity's extracted signals into a brief.
+
+    POST rather than GET because it costs an LLM call. Reads the stored
+    signals rather than Rox's raw narrative, so every claim traces back to a
+    typed signal, a verbatim evidence span, and a whitelisted source.
+    """
+    brief = await brief_for_opportunity(session, opportunity_id)
+    if brief is None:
+        raise HTTPException(
+            409,
+            "no extracted signals for this opportunity — "
+            "run POST /admin/signals/extract first",
+        )
+    return brief
 
 
 async def _prospect_in_background(opportunity_id: str) -> None:

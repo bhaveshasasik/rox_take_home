@@ -2,19 +2,24 @@
 
 import { ArrowLeft, Check, FileQuestion } from "lucide-react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useState } from "react";
 
 import { ApiError } from "@/api/client";
 import { ErrorState } from "@/components/pipeline/error-state";
 import { StatusPill } from "@/components/pipeline/status-pill";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
 import { formatAge, pipelineStatus } from "@/lib/pipeline";
 
 import { DetailSkeleton } from "./detail-skeleton";
+import { ProspectingTab } from "./prospecting-tab";
 import { RejectDialog } from "./reject-dialog";
 import {
   AccountContext,
   ActivityTimeline,
+  RecentSignals,
   ResearchSummary,
   ScoreBreakdown,
   SectionLabel,
@@ -25,6 +30,9 @@ export function OpportunityDetailView({ id }: { id: string }) {
   const query = useOpportunity(id);
   const decide = useDecide(id);
   const [rejectOpen, setRejectOpen] = useState(false);
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   if (query.isPending) return <DetailSkeleton />;
 
@@ -47,6 +55,23 @@ export function OpportunityDetailView({ id }: { id: string }) {
   const detail = query.data;
   const accountName = detail.account_name ?? "Unknown account";
   const decided = detail.status !== "new";
+  // Prospecting only ever runs for accepted opportunities.
+  const isAccepted = detail.status === "accepted";
+
+  // The tab lives in the URL so a prospecting view is linkable and the back
+  // button leaves it. `?tab=prospecting` on a non-accepted opportunity falls
+  // back to Overview rather than showing a disabled tab's content.
+  const activeTab =
+    searchParams.get("tab") === "prospecting" && isAccepted ? "prospecting" : "overview";
+
+  const selectTab = (value: string) => {
+    const params = new URLSearchParams(searchParams.toString());
+    // Overview is the default, so it stays out of the URL.
+    if (value === "overview") params.delete("tab");
+    else params.set("tab", value);
+    const query = params.toString();
+    router.push(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  };
 
   return (
     <>
@@ -78,26 +103,56 @@ export function OpportunityDetailView({ id }: { id: string }) {
       </header>
 
       {/* pb clears the fixed action bar */}
-      <div className="flex min-h-0 pb-[57px]">
-        <div className="border-border min-w-0 flex-1 border-r">
-          <section className="border-border border-b px-6 py-5">
-            <SectionLabel>Rationale</SectionLabel>
-            <p className="text-[13px] leading-[1.65]">{detail.rationale}</p>
-          </section>
+      <Tabs value={activeTab} onValueChange={selectTab} className="min-h-0 gap-0 pb-[57px]">
+        <TabsList className="border-border bg-card h-auto w-full justify-start rounded-none border-b p-0">
+          <TabTrigger value="overview">Overview</TabTrigger>
+          {/* Disabled rather than hidden: the capability exists, it is just not
+              available yet — which is also what the API says, returning 409
+              "prospecting only runs for accepted opportunities" rather than a
+              404. Hiding it would leave a reviewer unsure prospecting exists. */}
+          <TabTrigger
+            value="prospecting"
+            disabled={!isAccepted}
+            title={
+              isAccepted ? undefined : "Prospecting runs once this opportunity is accepted"
+            }
+          >
+            Prospecting
+          </TabTrigger>
+        </TabsList>
 
-          <ScoreBreakdown
-            score={detail.qualification_score}
-            signals={(detail.research ?? []).flatMap((a) => a.signals ?? [])}
-          />
+        <TabsContent value="overview" className="flex min-h-0">
+          <div className="border-border min-w-0 flex-1 border-r">
+            <section className="border-border border-b px-6 py-5">
+              <SectionLabel>Rationale</SectionLabel>
+              <p className="text-[13px] leading-[1.65]">{detail.rationale}</p>
+            </section>
 
-          <ResearchSummary research={detail.research} />
-        </div>
+            <ScoreBreakdown
+              score={detail.qualification_score}
+              breakdown={detail.score_breakdown}
+              signals={(detail.research ?? []).flatMap((a) => a.signals ?? [])}
+            />
 
-        <aside className="w-72 shrink-0">
-          <AccountContext detail={detail} />
-          <ActivityTimeline detail={detail} />
-        </aside>
-      </div>
+            <ResearchSummary
+              research={detail.research}
+              extractedSignals={detail.extracted_signals}
+            />
+          </div>
+
+          <aside className="w-72 shrink-0">
+            <AccountContext detail={detail} />
+            <RecentSignals signals={detail.extracted_signals ?? []} />
+            <ActivityTimeline detail={detail} />
+          </aside>
+        </TabsContent>
+
+        <TabsContent value="prospecting" className="min-h-0">
+          {/* mounted only when selected, so polling never starts for an
+              opportunity whose prospecting tab was never opened */}
+          {isAccepted && <ProspectingTab opportunityId={detail.id} />}
+        </TabsContent>
+      </Tabs>
 
       <div className="border-border bg-card fixed right-0 bottom-0 left-0 z-40 flex items-center justify-between gap-4 border-t px-6 py-3">
         <p className="text-muted-foreground min-w-0 truncate text-[11px]">
@@ -156,6 +211,38 @@ export function OpportunityDetailView({ id }: { id: string }) {
         }
       />
     </>
+  );
+}
+
+/** Underlined-on-active tab, matching the flat chrome the rest of the app uses. */
+function TabTrigger({
+  value,
+  children,
+  disabled,
+  title,
+}: {
+  value: string;
+  children: React.ReactNode;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <TabsTrigger
+      value={value}
+      disabled={disabled}
+      title={title}
+      className={cn(
+        // shadcn's trigger is `flex-1`, which stretches two tabs across the
+        // full width; these sit left-aligned at their natural size.
+        "flex-none rounded-none border-0 border-b-2 border-transparent bg-transparent px-6 py-2.5",
+        "text-muted-foreground text-[12px] font-medium shadow-none",
+        "data-[state=active]:border-foreground data-[state=active]:text-foreground",
+        "data-[state=active]:bg-transparent data-[state=active]:shadow-none",
+        "disabled:pointer-events-auto disabled:cursor-not-allowed disabled:opacity-40",
+      )}
+    >
+      {children}
+    </TabsTrigger>
   );
 }
 

@@ -1,0 +1,208 @@
+ROX API — verified against https://core.roxai.dev/api/v1 on 2026-07-27
+Auth: Authorization: Bearer $ROX_API_TOKEN
+Org: Rox SE <roxdemointerview4@workday.com>  |  21 accounts, 53 people
+Full notes + response shapes: .claude/skills/rox-api/SKILL.md
+
+Legend:  [OK] verified working   [X] does not work as documented   [-] not useful here
+
+
+================================================================================
+ACCOUNTS / IDENTITY
+================================================================================
+[OK] GET  /user/me
+       -> {name, email}   NOTE: returns NO ids. rox_user_id/rox_org_id come from
+          /priorities or POST /sequences.
+
+[OK] GET  /hierarchy/customers
+       -> BARE ARRAY of accounts. Fields are customer_id / customer_name
+          (NOT id/name), plus domain, hierarchy_parent_id, children[].
+          The only source of account NAMES.
+
+
+================================================================================
+RESEARCH — reading
+================================================================================
+[OK] GET  /account_research/account_research_section
+       -> BARE ARRAY (~95). {id, name, description, column_id, created_by_name}
+          NOTE: `id` is the section, `column_id` is the column. Cells are
+          addressed by column_id. Names repeat -> dedupe on column_id.
+          ~30% of columns 403 "Section ... not available for the user".
+
+[OK] GET|POST /agents/customers_paginated/:column_id      *** PREFERRED READ ***
+       -> One call returns ALL customers' values for a column.
+          [{customer_id, domain, "<Column Name>": "...", section_id,
+            column_name, value_structured:{string_value}}]
+          Read value_structured.string_value (stable key).
+          Ungenerated cell -> value_structured: null
+          63 requests -> 3 for our 3 columns.
+       WARNING: POST is the SAME READ as GET. It does NOT generate cells.
+       WARNING: "paginated" is a misnomer - page/page_size/limit/offset/per_page
+                are all IGNORED; always returns all 21.
+       WARNING: row order is NON-DETERMINISTIC. Key by customer_id.
+       NOTE: returns domain but NOT customer name -> join /hierarchy/customers.
+
+[OK] GET  /research/clever_column/:column_id/cell/:entity_id
+       (entity_id = customer_id) single-cell read; values byte-identical to bulk.
+       -> {column_id, entity_id, cell_value, output:{type,text,sources}, updated_at}
+       WARNING: `output` is a DICT and therefore truthy. A naive "first non-empty
+                key" extractor reads an EMPTY cell as populated. Use cell_value,
+                fall back to output.text.
+       NOTE: no status field. Ungenerated == empty string.
+
+
+================================================================================
+RESEARCH — generation  (the important part)
+================================================================================
+[OK] POST /research/clever_column/:column_id/refresh_by_tab/:tab_id   *** THE TRIGGER ***
+       Empty body. Pass rox_org_id as tab_id to refresh ALL accounts.
+       Verified on Opportunity Signal: enqueued 1x CUSTOM_COLUMN_GENERATION +
+       21x CUSTOM_CELL_GENERATION within 20s, all COMPLETED in ~175s, with
+       genuinely new content (Genpact 7->2, HP 4->8).
+       WARNING: returns "Successfully triggered refresh" for ANY uuid, including
+                all-zeros, and for columns where nothing happens. The message is
+                NOT validation - confirm real work via /priority_jobs.
+       ONLY WORKS ON UI-CREATED COLUMNS (see below).
+
+[X]  POST /research/clever_column
+[X]  POST /research/clever_column/auto_create
+       Both create the column + section and return {success, column_id}, but
+       NEVER enqueue a generation job. Cells stay empty indefinitely
+       (verified 40+ min, 6 columns, all tool_settings/org_wide variants).
+       refresh_by_tab on these yields PROPAGATE_CUSTOM_COLUMN_UPDATE with
+       ZERO children. So do NOT build a pipeline on API-created columns.
+       => AUTHOR COLUMNS IN THE ROX UI, then drive regeneration via refresh_by_tab.
+
+       Body shape if still needed:
+         {org_wide, hidden, column_config:{
+            name, column_value_format: BOOLEAN|ENUM|NUMBER|TEXT|DATE, enum_values,
+            workflow:{version, steps:[{name, instructions, tool_settings,
+                                       model_type: fast|standard|deep}]}}}
+       NOTE: the prompt field is `instructions`, NOT `prompt`.
+       NOTE: column_config accepts ONLY name/column_value_format/workflow/enum_values.
+             No way to scope a column to specific entities.
+
+[OK] POST /research/clever_column/auto_config
+       {user_prompt} -> {reasoning, column_config{...}}  Creates NOTHING.
+       Genuinely good: writes a better `instructions` prompt than hand-authoring
+       and picks model_type. Useful as a "propose a column" feature.
+
+[X]  PATCH|PUT /research/clever_column/:column_id
+       {column_config} -> enqueues PROPAGATE_CUSTOM_COLUMN_UPDATE, which completes
+       with ZERO children. Propagates config; does NOT generate cells.
+       WARNING: silently DROPS unknown fields - regenerate, force_regenerate,
+                generate_cells, backfill, recompute, entity_ids, rox_company_ids
+                were all "accepted" identically and all did nothing.
+
+[ ]  POST /research/clever_column/feedback   (not exercised)
+       Requires column_id, rox_company_id, rox_org_id, rox_user_id, thumbs_up.
+
+
+================================================================================
+JOBS / TELEMETRY
+================================================================================
+[OK] GET  /priority_jobs                          (GET-only; cannot POST a job)
+     GET  /priority_jobs/:task_run_id
+       params: task_type, task_state, rox_company_id, num_lookback_days,
+               num_lookback_hours
+       -> {run_id, parent_task_run_id, root_task_run_id, task_type, artifact_id,
+           current_state, task_priority, created_on, last_modified,
+           aggregate_status_of_children}
+       task_type: CUSTOM_COLUMN_GENERATION      (artifact_id = column_id)
+                  CUSTOM_CELL_GENERATION        (artifact_id = CUSTOMER_id)
+                  PROPAGATE_CUSTOM_COLUMN_UPDATE (config only, no cell work)
+       state: COMPLETED | RUNNING | SKIPPED
+       USE THIS to know when a refresh has actually finished (~90s/cell), and as
+       automation-health telemetry for reporting.
+
+
+================================================================================
+PROSPECTING
+================================================================================
+[OK] GET  /people?rox_company_id=<customer_id>          (422 without the param)
+       -> {data:[{rox_person_id, person_id, name, title, email, linkedin_url,
+                  seniority, persona, engagement_status, company_domain, city}],
+           next_page_id, total_count, total_pages}
+       This org: 53 people across 11 of 21 accounts; 41 have email, 53 LinkedIn.
+       NOTE: seniority usually null, persona usually "ANY" -> filter on TITLE text.
+
+[OK] GET  /campaigns   and   GET /campaigns/:public_id
+       -> {data:[{public_id, name, user_input, column_ids[], num_sequences,
+                  num_generated, num_sent, total_opens, sequence_build_public_id}]}
+       Campaigns are prebuilt plays wired to a research column:
+         Expansion Intro  -> Opportunity Signal   (8 generated sequences)
+         Save Play        -> Risk Signal
+         Follow-Up Nudge  -> Engagement Recency
+
+[OK] GET  /sequences?campaign_id=<campaign_public_id>    (422 without campaign_id)
+       Best reference for what good generated outreach looks like.
+       sequence_tasks[].content = {email_subject, email_body}  (email_body is HTML)
+       Also: background_content.sources[], scheduled_send_date, status,
+             step_type, channel_type, has_reply, email_replies[], sent_date.
+
+[OK] POST /sequences
+       {background_content:{content,sources[]},        <- OBJECT, not a string
+        customer_id, rox_person_id,
+        sequence_tasks:[{background, content:{email_subject, email_body},
+                         scheduled_send_date:"yyyy-mm-dd"}]}
+       -> full sequence, status DRAFT
+       WARNING: rox_person_id is NOT FK-validated - an all-zeros uuid is accepted.
+                Always pass a real id from /people.
+       WARNING: campaign_request_public_id / campaign_type are SILENTLY DROPPED.
+                An API-created sequence CANNOT be linked to a campaign, and there
+                is no campaign run/generate trigger. => Rox will NOT author the
+                email for you; supply email_subject/email_body yourself.
+       NOTE: step_type is normalized on write (automated_ai_generated_email -> email).
+       NOTE: one sequence targets ONE person -> N contacts = N calls.
+
+[OK] GET  /priorities
+       -> 3 defs: LOW/MED/HIGH (value 100/200/300), each with rox_org_id +
+          rox_user_id. Easiest source of those two ids.
+
+
+================================================================================
+NOT USEFUL HERE
+================================================================================
+[-]  POST /unified_data/column_state
+       {object_logical_name, field_logical_names[], rox_entity_ids[]}
+       -> {states, provider_ids, last_updated}
+       objects: company|person|deal|user|organization|event|lead|rox_email|
+                rox_email_event|sequence|sequence_task|contract*
+[-]  POST /unified_data/column_metadata
+       {logical_names:[{object_logical_name, field_logical_name}]}
+       Both are CRM field-provenance lookups. Returned EMPTY - no CRM connected.
+
+[X]  /tabs, /hierarchy/tabs, /views, /segments, /lists  - do not exist.
+       (/hierarchy/tabs is really /hierarchy/:uuid; "tabs" fails the uuid pattern.)
+       No endpoint lists tab_ids; rox_org_id works as the "all accounts" tab.
+
+
+================================================================================
+POPULATED COLUMNS (what we actually read)
+================================================================================
+  Opportunity Signal   ece93caa-a27b-47b1-9c5c-15925cb662aa   21/21
+      "7 — <rationale>"        score 0-10, EM-DASH separator
+  Risk Signal          202ac260-f693-4314-a7c8-152a16c9d77f   21/21
+      "Low - <rationale>" OR "2 - <rationale>"   mixed word/number, INVERTED
+  Engagement Recency   575fc0bb-90c3-4f28-8c68-0fcb42c437de   21/21
+      "N/A - <rationale>"
+  Key Contacts         50546ef8-bbb5-4676-8bd4-62ebfd874e21   10/21
+  Board Priorities / Firmographics                             2/21  (sparse)
+
+PARSING GOTCHAS:
+  - Score scale is 0-10, NOT 0-100. A naive parse gives 7 and fails a 0-100
+    threshold of 60. Multiply by 10.
+  - Separators differ: Opportunity Signal uses em-dash (—), Risk Signal hyphen (-).
+  - Risk Signal mixes Low|Medium|High with 0-10, and LOW IS GOOD - do not add
+    it to a score as-is.
+  - Stored values are capped ~300 chars with a trailing "..." (Rox-side, present
+    in both bulk and single-cell reads).
+
+
+================================================================================
+PIPELINE LOOP  (~6 calls/cycle for 3 columns)
+================================================================================
+  1. POST /research/clever_column/:col/refresh_by_tab/:rox_org_id     x3
+  2. GET  /priority_jobs   -> poll until CUSTOM_CELL_GENERATION children COMPLETE
+  3. GET  /agents/customers_paginated/:col                            x3
+  4. GET  /hierarchy/customers   -> join names
+  On accept: GET /people?rox_company_id=...  then  POST /sequences (per contact)

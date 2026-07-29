@@ -6,6 +6,8 @@ import { api, type ResponseOf, type Schemas } from "@/api/client";
 
 export type OpportunityDetail = Schemas["OpportunityDetailOut"];
 export type ResearchSignal = Schemas["ResearchSignalOut"];
+export type ExtractedSignal = Schemas["ExtractedSignalOut"];
+export type SourceRef = Schemas["SourceRefOut"];
 
 /** The spec's enum is the whole vocabulary — no invented reasons. */
 export const REASON_CODES = [

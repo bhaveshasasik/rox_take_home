@@ -127,12 +127,68 @@ class TestRoxProvider:
         assert body["rox_person_id"] in {"p-cfo", "p-vp", "p-hr"}
         # background_content must be an object, not a string
         assert isinstance(body["background_content"], dict)
+        # nothing extracted for this opportunity, so the legacy rationale
+        # scrape still supplies the sources
         assert body["background_content"]["sources"] == ["https://example.com/pr"]
 
         task = body["sequence_tasks"][0]
         assert task["content"]["email_subject"]
         assert task["content"]["email_body"].startswith("<p>")
         assert len(task["scheduled_send_date"]) == 10  # yyyy-mm-dd
+
+    async def test_sources_come_from_extracted_signals_when_available(self, session):
+        """The scrape above has never produced anything in production —
+        `parse_cell` strips citations before the rationale is written, so zero
+        of the 21 live opportunities contain "http" and every Rox sequence
+        shipped with `sources: []`. Extracted signals carry the real URLs."""
+        from app.models import OpportunityResearchLink, ResearchArtifact, ResearchColumn, ResearchRun
+        from app.signals.models import ArtifactExtraction, ExtractedSignalRow
+
+        account, opp = await seed(session)
+        column = ResearchColumn(key="opportunity_signal", name="Opportunity-Signal Research")
+        run = ResearchRun(trigger="test")
+        session.add_all([column, run])
+        await session.flush()
+        artifact = ResearchArtifact(
+            run_id=run.id, account_id=account.id, column_id=column.id, cell_value="cell"
+        )
+        session.add(artifact)
+        await session.flush()
+        session.add(
+            OpportunityResearchLink(opportunity_id=opp.id, artifact_id=artifact.id)
+        )
+        extraction = ArtifactExtraction(
+            artifact_id=artifact.id,
+            account_id=account.id,
+            content_hash="h",
+            schema_version=1,
+        )
+        session.add(extraction)
+        await session.flush()
+        session.add(
+            ExtractedSignalRow(
+                extraction_id=extraction.id,
+                signal_type="growth_expansion",
+                confidence=8,
+                rationale="r",
+                evidence="e",
+                sources=[
+                    {"url": "https://sec.gov/filing", "kind": "web"},
+                    # internal CRM pointer — must not be sent to Rox as a source
+                    {"url": "rox://contact/abc", "kind": "rox"},
+                ],
+            )
+        )
+        await session.commit()
+
+        router = mock_prospecting()
+        with router:
+            async with RoxClient(base_url=BASE, token="t") as rox:
+                await run_prospecting(session, opp, RoxProspectingProvider(rox))
+
+        assert router.created[0]["background_content"]["sources"] == [
+            "https://sec.gov/filing"
+        ]
 
     async def test_real_person_ids_are_persisted(self, session):
         account, opp = await seed(session)

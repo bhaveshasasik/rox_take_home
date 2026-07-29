@@ -16,7 +16,7 @@ cp .env.example .env          # fill in ROX_API_TOKEN
 Swagger UI: http://localhost:8000/docs
 
 ```bash
-.venv/bin/python -m pytest -q      # 102 tests, Rox mocked via respx
+.venv/bin/python -m pytest -q      # 149 tests, Rox mocked via respx
 ```
 
 Trigger a cycle without waiting for the scheduler:
@@ -110,6 +110,11 @@ same underlying signal.
 | POST | `/prospecting/opportunities/{id}/run` | retry prospecting |
 | GET | `/reporting/overview` | every dashboard section in one call |
 | GET | `/reporting/{funnel,score-calibration,signal-performance,decision-latency,rejection-reasons,account-coverage,prospecting-yield,run-health,job-telemetry}` | individual reports |
+| GET | `/opportunities/stats` | pending + aging counts for the pipeline header |
+| GET | `/research/runs`, `/research/columns` | automation visibility |
+| GET | `/notifications`, POST `/notifications/{id}/retry` | delivery audit + retry |
+| POST | `/admin/research/run` | trigger a cycle now |
+| GET | `/admin/rox/me` | Rox connectivity check |
 
 Every database-backed report accepts an optional `start`/`end` window, half-open
 as `[start, end)` so adjacent windows tile without double-counting a boundary
@@ -123,10 +128,6 @@ own `lookback_hours`. Two reports take an extra knob:
 |---|---|---|
 | `/reporting/score-calibration` | `buckets=N` | equal-width score buckets (`10` for deciles). Omit for the default named bands `0-59 / 60-74 / 75-89 / 90-100`. |
 | `/reporting/rejection-reasons` | `group_by=day\|week` | fills `series` with long-form `(period, reason_code, count)` rows for a reasons-over-time chart. Omit for totals only. |
-| GET | `/research/runs`, `/research/columns` | automation visibility |
-| GET | `/notifications`, POST `/notifications/{id}/retry` | delivery audit + retry |
-| POST | `/admin/research/run` | trigger a cycle now |
-| GET | `/admin/rox/me` | Rox connectivity check |
 
 ## Reporting — and why these metrics
 
@@ -139,7 +140,7 @@ own `lookback_hours`. Two reports take an extra knob:
 | Rejection reasons | What to fix upstream — e.g. lots of `already_engaged` ⇒ dedupe against CRM first. |
 | Account coverage | Which target accounts are we ignoring entirely? |
 | Prospecting yield | Does an accept reliably become real outreach? |
-| Run health / job telemetry | Is the automation healthy? `job-telemetry` reads Rox's own task queue live. |
+| Run health / job telemetry | Is the automation healthy? `cells_unscoreable` counts research that was fetched and then discarded — a rising share means Rox is returning a shape the parser no longer reads, which is otherwise invisible. `job-telemetry` reads Rox's own task queue live. |
 
 ## Configuration
 

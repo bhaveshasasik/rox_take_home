@@ -21,6 +21,10 @@ os.environ.update(
         "ROX_ORG_ID": "b2a7ec35-8d8e-4e35-9355-8c29a5220a3f",
         "SMTP_HOST": "",
         "APP_BASE_URL": "http://localhost:3000",
+        # Pinned so the suite does not inherit whatever the developer's .env
+        # says. Tests that want extraction on override the setting directly.
+        "EXTRACTION_ENABLED": "false",
+        "RESEARCH_SCHEDULER_ENABLED": "false",
     }
 )
 
@@ -63,6 +67,22 @@ def _no_real_llm_calls():
             "app.services.notifications.write_notification_summary",
             AsyncMock(return_value=FAKE_NOTIFICATION_SUMMARY),
         ),
+        # app/signals: both call sites reach Anthropic directly. Only the
+        # network call is stubbed, so the source resolution and scoring around
+        # them still run for real. Returning None makes the default a recorded
+        # failure rather than fabricated signals — the safer default for a test
+        # that forgot to set up its own return value.
+        #
+        # Note the two different patch targets. `extract_cell` is resolved
+        # through its own module's globals at call time, so patching where it
+        # is defined works. `write_brief` is bound into `service`'s namespace
+        # by a from-import, so it has to be patched *there* — patching
+        # `elaboration.write_brief` would leave the real one reachable.
+        patch("app.signals.extraction.extract_cell", AsyncMock(return_value=None)),
+        patch("app.signals.service.write_brief", AsyncMock(return_value=None)),
+        # `opportunities` imports write_brief by name, so it needs its own
+        # patch target for the same reason `service` does.
+        patch("app.services.opportunities.write_brief", AsyncMock(return_value=None)),
     ):
         yield
 

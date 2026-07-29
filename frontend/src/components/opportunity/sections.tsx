@@ -1,9 +1,17 @@
 "use client";
 
+import { ExternalLink } from "lucide-react";
+import { useState } from "react";
+
 import { formatAge, humanizeStage } from "@/lib/pipeline";
 import { cn } from "@/lib/utils";
 
-import type { OpportunityDetail, ResearchSignal } from "./use-opportunity";
+import type {
+  ExtractedSignal,
+  OpportunityDetail,
+  ResearchSignal,
+  SourceRef,
+} from "./use-opportunity";
 
 export function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -17,30 +25,60 @@ function absoluteTime(iso: string) {
   return new Date(iso).toLocaleString();
 }
 
-/** Neutral fill — a score bar is a magnitude, not a status, so it carries no colour. */
+/**
+ * A magnitude bar. Positive contributions carry no colour — magnitude is not a
+ * status. Deductions do, because "this lowered the score" is meaning rather
+ * than decoration, and a signed number alone is easy to skim past.
+ */
 function ScoreBar({ value }: { value: number }) {
   return (
     <div className="bg-muted h-1 w-full overflow-hidden rounded-full">
-      <div className="bg-foreground/25 h-full rounded-full" style={{ width: `${value}%` }} />
+      <div
+        className={cn(
+          "h-full rounded-full",
+          value < 0 ? "bg-age-overdue/40" : "bg-foreground/25",
+        )}
+        style={{ width: `${Math.min(100, Math.abs(value))}%` }}
+      />
     </div>
   );
 }
 
+/** Factor names are a fixed backend vocabulary; anything unmapped degrades to
+ *  a humanised form rather than rendering a raw slug. */
+const FACTOR_LABELS: Record<string, string> = {
+  signal_strength: "Signal strength",
+  corroboration: "Corroboration",
+  evidence_gaps: "Evidence gaps",
+  out_of_scope: "Out of scope",
+  disputed_evidence: "Disputed evidence",
+  range_cap: "Range cap",
+};
+
+function factorLabel(name: string) {
+  return FACTOR_LABELS[name] ?? name.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
 /**
- * The score and the signals that produced it.
+ * The score and the factors that composed it.
  *
- * The design mocks four weighted factors (Signal strength 35%, Account fit 30%,
- * …). No such weights exist — the score is the highest-scoring signal in the
- * research cell, so the real breakdown is the signals themselves. The top row
- * therefore equals the headline number rather than averaging to it.
+ * The factors are additive and sum exactly to the total, so the list is a
+ * derivation rather than a set of weighted axes — which is why entries can be
+ * negative or zero and why their number varies between accounts.
  */
 export function ScoreBreakdown({
   score,
+  breakdown,
   signals,
 }: {
   score: number;
+  breakdown?: OpportunityDetail["score_breakdown"];
   signals: ResearchSignal[];
 }) {
+  const factors = breakdown?.factors ?? [];
+  // The stored score is the fallback: it is what an unextracted opportunity has
+  // and all it has.
+  const headline = breakdown?.total ?? score;
   const scored = signals.filter((s) => s.score !== null && s.score !== undefined);
 
   return (
@@ -48,16 +86,35 @@ export function ScoreBreakdown({
       <div className="mb-4 flex items-baseline justify-between">
         <SectionLabel>Score breakdown</SectionLabel>
         <span className="font-mono text-[22px] leading-none font-semibold tabular-nums">
-          {score}
+          {headline}
         </span>
       </div>
 
-      {scored.length === 0 ? (
-        <p className="text-muted-foreground text-[12px] leading-relaxed">
-          Rox returned narrative research for this account rather than scored
-          signals, so there is no per-signal breakdown behind this number.
-        </p>
-      ) : (
+      {factors.length > 0 ? (
+        <div className="space-y-3.5">
+          {factors.map((factor) => (
+            <div key={factor.name}>
+              <div className="mb-1.5 flex items-baseline justify-between gap-3">
+                <span className="truncate text-[12px]">{factorLabel(factor.name)}</span>
+                <span
+                  className={cn(
+                    "font-mono text-[12px] font-medium tabular-nums",
+                    factor.points < 0 && "text-age-overdue",
+                    factor.points === 0 && "text-muted-foreground",
+                  )}
+                >
+                  {factor.points > 0 ? `+${factor.points}` : factor.points}
+                </span>
+              </div>
+              {factor.points !== 0 && <ScoreBar value={factor.points} />}
+              <p className="text-muted-foreground mt-1 text-[11px] leading-snug">
+                {factor.detail}
+              </p>
+            </div>
+          ))}
+        </div>
+      ) : scored.length > 0 ? (
+        // Not yet extracted: the per-signal view is the only breakdown available.
         <div className="space-y-3.5">
           {scored.map((signal, index) => (
             <div key={`${signal.signal}-${index}`}>
@@ -71,21 +128,281 @@ export function ScoreBreakdown({
             </div>
           ))}
           <p className="text-muted-foreground pt-1 text-[10px]">
-            The opportunity score is the strongest signal, not an average.
+            This opportunity predates structured extraction, so the breakdown is
+            its signals rather than scoring factors.
           </p>
         </div>
+      ) : (
+        <p className="text-muted-foreground text-[12px] leading-relaxed">
+          No scored signals were recovered from this account&rsquo;s research, so
+          there is no breakdown behind this number.
+        </p>
       )}
     </section>
   );
 }
 
 /**
- * Research in labelled sections. Each artifact carries the source (the Rox
- * research column) and when it was fetched; each signal inside it is a section.
- * The design links the source out — there is no URL field, so the source is
- * shown as text rather than a dead link.
+ * How many signals each list shows before asking.
+ *
+ * Ranking comes from the API — strongest first, absences last, with a stable
+ * tiebreak — so "the first N" is meaningful rather than arbitrary. Capping is
+ * a layout decision and stays here; the response keeps every signal because
+ * the score composes from all of them.
  */
-export function ResearchSummary({ research }: { research: OpportunityDetail["research"] }) {
+const RESEARCH_PREVIEW = 3;
+const RAIL_PREVIEW = 5;
+
+/** Never a silent cut: the count of what is hidden is always visible, and it
+ *  is always one click to see it. */
+function MoreToggle({
+  hidden,
+  expanded,
+  onToggle,
+  noun = "signal",
+}: {
+  hidden: number;
+  expanded: boolean;
+  onToggle: () => void;
+  noun?: string;
+}) {
+  if (hidden <= 0 && !expanded) return null;
+
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="text-muted-foreground hover:text-foreground mt-3 text-[11px] transition-colors duration-75"
+    >
+      {expanded
+        ? "Show fewer"
+        : `Show ${hidden} more ${hidden === 1 ? noun : `${noun}s`}`}
+    </button>
+  );
+}
+
+/**
+ * A signal's supporting text: the verbatim span, or an explicit statement that
+ * there isn't one.
+ *
+ * Never falls back to the signal's rationale. Rationale is generated prose;
+ * substituting it here would present an unverifiable sentence in the place a
+ * reader expects quoted source text, which is worse than an empty slot.
+ */
+function Evidence({ text, label }: { text: string; label: string }) {
+  const body = readable(text ?? "", label);
+  if (!body) {
+    return (
+      <p className="text-muted-foreground text-[12px] leading-[1.65] italic">
+        No supporting text was captured for this signal.
+      </p>
+    );
+  }
+  return <p className="text-[12px] leading-[1.65]">{body}</p>;
+}
+
+/** `rox://contact/<uuid>` refs point into the CRM, not the web — they are
+ *  traceability, not something a reader can open. */
+function SourceLinks({ sources }: { sources: SourceRef[] }) {
+  const web = sources.filter((s) => s.kind === "web");
+  if (web.length === 0) return null;
+
+  return (
+    <span className="flex items-center gap-1.5">
+      {web.map((source) => (
+        <a
+          key={source.url}
+          href={source.url}
+          target="_blank"
+          rel="noreferrer noopener"
+          title={source.url}
+          className="text-muted-foreground hover:text-foreground inline-flex max-w-[120px] items-center gap-1 text-[10px] transition-colors duration-75"
+        >
+          <span className="truncate">{hostname(source.url)}</span>
+          <ExternalLink size={9} strokeWidth={2} aria-hidden />
+        </a>
+      ))}
+    </span>
+  );
+}
+
+function hostname(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * `[\[1\]](https://…)` footnotes, and bare `[\[1\]]` markers.
+ *
+ * Evidence is stored verbatim so the citation URLs can be recovered from it and
+ * checked against the artifact's known sources. That makes the markup part of
+ * the text rather than something the server strips, so it comes off here — the
+ * same URLs are already rendered as links beside the heading.
+ */
+const CITATION = /\[\\?\[\d+\\?\]\](?:\([^)]*\))?/g;
+
+/** `… found. Confidence: 9.` — the model restating its own field inside the
+ *  span. It is metadata, and the confidence is already shown beside the label. */
+const TRAILING_CONFIDENCE = /[\s.;—-]*\(?\s*confidence[^.\n]{0,40}\)?\s*\.?\s*$/i;
+
+const alpha = (s: string) => s.toLowerCase().replace(/[^a-z]/g, "");
+
+/**
+ * Drop a leading restatement of the signal's own category.
+ *
+ * "Growth / Expansion signals (headcount, hiring, funding): No account-level
+ * evidence found" duplicates the label rendered directly above it.
+ *
+ * Matched against *this signal's label* rather than a list of category names.
+ * A vocabulary regex here would need extending every time the wording drifts,
+ * which is exactly how the old parser became unmaintainable — and it would
+ * happily strip a leading clause that merely resembled a category.
+ */
+function stripLabelPrefix(text: string, label?: string) {
+  if (!label) return text;
+  const colon = text.indexOf(":");
+  if (colon < 0 || colon > 90) return text;
+
+  const head = alpha(
+    text
+      .slice(0, colon)
+      .replace(/\(.*?\)/g, "") // parenthetical enumerations of what was looked for
+      .replace(/\b(evidence of|signals?|events?|mentions?|indicators?)\b/gi, ""),
+  );
+  const want = alpha(label);
+  if (!head || !want) return text;
+  if (!(head === want || head.includes(want) || want.includes(head))) return text;
+
+  // The parenthetical in a prefix enumerates what research looked for
+  // ("(incumbent dissatisfaction, RFPs, replacement)"), which is worth keeping.
+  // When the remainder is this short the prefix was carrying the substance —
+  // "no evidence found." on its own says less than the heading already does —
+  // so the mild duplication beats the loss.
+  const rest = text.slice(colon + 1).trim();
+  return rest.length >= 40 ? rest : text;
+}
+
+/** HTML tags. React escapes them, so they reach the page as a literal `<br>`
+ *  and read as broken output. Never legitimate in research prose. */
+const TAGS = /<\/?[a-z][^>]*>/gi;
+
+/**
+ * Structural debris that does not belong in prose: brace/quote runs and
+ * `key: value` or `key=value` fragments posing as structured fields.
+ *
+ * This flags, it does not scrub. Research text is third-party and this data
+ * contains at least three payload shapes — `','is_absence':true,'x':0}`,
+ * `,is_absence=true`, and `I"x":0}}"}}}`. A regex that removed some and missed
+ * others would leave the page looking clean while the rest still rendered,
+ * which is worse than showing all of it and saying the source is malformed.
+ *
+ * The controls that matter are upstream: the extraction prompt treats
+ * narrative text as data rather than instruction, and `contests_absence`
+ * checks the model against its own evidence. This is the reviewer's warning
+ * that the underlying cell is not trustworthy prose.
+ */
+const MALFORMED = /<\/?[a-z][^>]*>|[{}]{2,}|['"][a-z_]{2,}['"]?\s*[:=]\s*(true|false|\d)/i;
+
+function looksMalformed(text: string) {
+  return MALFORMED.test(text ?? "");
+}
+
+function readable(text: string, label?: string) {
+  return stripLabelPrefix(text.replace(CITATION, ""), label)
+    .replace(TAGS, " ")
+    .replace(TRAILING_CONFIDENCE, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([.,;])/g, "$1")
+    .trim();
+}
+
+/**
+ * Extracted signals as labelled sections, each with the citations backing it.
+ *
+ * Falls back to the artifact's parsed signals, then to its narrative prose, for
+ * opportunities whose research predates structured extraction.
+ */
+export function ResearchSummary({
+  research,
+  extractedSignals = [],
+}: {
+  research: OpportunityDetail["research"];
+  extractedSignals?: ExtractedSignal[];
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (extractedSignals.length > 0) {
+    const fetchedAt = (research ?? [])[0]?.fetched_at;
+    const columnName = (research ?? [])[0]?.column_name;
+    const shown = expanded ? extractedSignals : extractedSignals.slice(0, RESEARCH_PREVIEW);
+
+    return (
+      <section className="px-6 py-5">
+        <SectionLabel>Research summary</SectionLabel>
+        <div className="space-y-5">
+          {shown.map((signal) => (
+            <article key={signal.id} className="border-border border-b pb-5 last:border-0 last:pb-0">
+              <div className="mb-1.5 flex items-center justify-between gap-3">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate text-[12px] font-medium">{signal.label}</span>
+                  {signal.is_absence && (
+                    <span className="text-muted-foreground shrink-0 text-[10px]">
+                      nothing found
+                    </span>
+                  )}
+                  {signal.contested && (
+                    <span className="text-age-overdue shrink-0 text-[10px]">disputed</span>
+                  )}
+                  {looksMalformed(signal.evidence) && (
+                    <span
+                      className="text-age-overdue shrink-0 text-[10px]"
+                      title="The source research contains markup or structured-data fragments. Read this evidence with care."
+                    >
+                      malformed source
+                    </span>
+                  )}
+                </span>
+                <div className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[10px]">
+                  <SourceLinks sources={signal.sources ?? []} />
+                  {fetchedAt && (
+                    <>
+                      {(signal.sources ?? []).some((s) => s.kind === "web") && (
+                        <span className="text-border">·</span>
+                      )}
+                      <span className="font-mono" title={absoluteTime(fetchedAt)}>
+                        {formatAge(fetchedAt)} ago
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+              {/* The verbatim span only. The per-signal rationale is generated
+                  prose and cannot be checked against the source, so it is not
+                  shown here — evidence can be, and is. */}
+              <Evidence text={signal.evidence} label={signal.label} />
+            </article>
+          ))}
+        </div>
+        <MoreToggle
+          hidden={extractedSignals.length - shown.length}
+          expanded={expanded}
+          onToggle={() => setExpanded((v) => !v)}
+        />
+        {columnName && (
+          <p className="text-muted-foreground/70 mt-4 text-[10px]">Source: {columnName}</p>
+        )}
+      </section>
+    );
+  }
+
+  return <LegacyResearchSummary research={research} />;
+}
+
+/** The pre-extraction rendering: parsed signals, or narrative prose. */
+function LegacyResearchSummary({ research }: { research: OpportunityDetail["research"] }) {
   // An artifact contributes either structured signals or a prose narrative.
   // Never `cell_value` — Rox truncates it mid-array, so it is often invalid.
   const artifacts = (research ?? []).filter(
@@ -156,6 +473,107 @@ export function ResearchSummary({ research }: { research: OpportunityDetail["res
 }
 
 /**
+ * The signals research found, strongest first.
+ *
+ * Absences are shown rather than filtered: "we checked buying intent and found
+ * nothing" is a finding a reviewer needs, and it is the most common single
+ * outcome in the data. They are visually demoted so they cannot be misread as
+ * evidence of opportunity.
+ */
+export function RecentSignals({ signals }: { signals: ExtractedSignal[] }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // `other` is the dismissed bucket — firmographics and reporting cadence. It
+  // scores nothing and reads as filler in a summary panel; the research section
+  // below still lists every finding.
+  const relevant = signals.filter((s) => s.signal_type !== "other");
+
+  if (relevant.length === 0 && signals.length > 0) {
+    return (
+      <section className="border-border border-b px-5 py-5">
+        <SectionLabel>Signals</SectionLabel>
+        <p className="text-muted-foreground text-[12px] leading-relaxed">
+          Research returned only out-of-category context for this account — no
+          growth, intent, timing, engagement, competitive or whitespace signals.
+        </p>
+      </section>
+    );
+  }
+
+  if (signals.length === 0) {
+    return (
+      <section className="border-border border-b px-5 py-5">
+        <SectionLabel>Signals</SectionLabel>
+        <p className="text-muted-foreground text-[12px] leading-relaxed">
+          This account&rsquo;s research has not been through structured
+          extraction yet, so there are no individual signals to list.
+        </p>
+      </section>
+    );
+  }
+
+  const shown = expanded ? relevant : relevant.slice(0, RAIL_PREVIEW);
+
+  return (
+    <section className="border-border border-b px-5 py-5">
+      <SectionLabel>Signals</SectionLabel>
+      <ul className="space-y-2.5">
+        {shown.map((signal) => {
+          const muted = signal.is_absence || signal.contested;
+          return (
+            <li key={signal.id} className="flex items-start gap-2">
+              <span
+                className={cn(
+                  "mt-[5px] size-[7px] shrink-0 rounded-full border",
+                  muted
+                    ? "border-border bg-background"
+                    : signal.confidence >= 8
+                      ? "border-foreground bg-foreground"
+                      : signal.confidence >= 6
+                        ? "border-muted-foreground bg-muted-foreground"
+                        : "border-muted-foreground bg-background",
+                )}
+                aria-hidden
+              />
+              <div className="min-w-0 flex-1">
+                {/* The evidence span, not the rationale — four findings can
+                    share one category, so the label alone would repeat with
+                    nothing to tell them apart, and generated prose is not the
+                    way to differentiate them. Clamped because this rail is an
+                    index; the full span is in the research section, untruncated. */}
+                <p
+                  className={cn(
+                    "line-clamp-2 text-[12px] leading-snug",
+                    muted && "text-muted-foreground",
+                  )}
+                  title={readable(signal.evidence, signal.label) || undefined}
+                >
+                  {readable(signal.evidence, signal.label) || signal.label}
+                </p>
+                <p className="text-muted-foreground mt-0.5 text-[10px] leading-none">
+                  {signal.label}
+                  <span className="text-border mx-1">·</span>
+                  {signal.is_absence
+                    ? "nothing found"
+                    : signal.contested
+                      ? "disputed, withheld"
+                      : `confidence ${signal.confidence}/10`}
+                </p>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      <MoreToggle
+        hidden={relevant.length - shown.length}
+        expanded={expanded}
+        onToggle={() => setExpanded((v) => !v)}
+      />
+    </section>
+  );
+}
+
+/**
  * Account context, built only from fields that exist. The design's panel lists
  * employees, revenue, segment, industry, HQ and founding year — none of which
  * the API supplies — so this shows the pipeline facts we do have.
@@ -185,11 +603,7 @@ export function AccountContext({ detail }: { detail: OpportunityDetail }) {
   );
 }
 
-/**
- * Real activity, assembled from the timestamps the record actually carries.
- * The design's "Recent signals" timeline (date + label + intensity) has no
- * backing field; this shows what verifiably happened to this opportunity.
- */
+/** What happened to this opportunity, newest first. */
 export function ActivityTimeline({ detail }: { detail: OpportunityDetail }) {
   const events: { at: string; label: string; strong?: boolean }[] = [
     { at: detail.created_at, label: "Opportunity created", strong: true },

@@ -25,8 +25,12 @@ from app.models import (
     utcnow,
 )
 from app.services.notifications import notify_batch
-from app.services.parsing import parse_cell
+#: Legacy path. Kept as the fallback for artifacts that have not been
+#: extracted — 357 of 432 at the time of writing — and used for nothing else.
+from app.services.parsing import ParsedCell, parse_cell
 from app.services.rationale import expand_rationale
+from app.signals.elaboration import write_brief
+from app.signals.service import scored_for_artifact
 
 log = get_logger(__name__)
 
@@ -113,9 +117,38 @@ async def create_opportunities_for_run(
         if account is None:
             continue
 
-        parsed = parse_cell(artifact.cell_value)
+        # Structured signals when the artifact has been extracted, the legacy
+        # parser when it has not. Both produce the same three values, so the
+        # rest of this loop does not care which one ran.
+        extracted = await scored_for_artifact(session, artifact.id)
+        if extracted is not None:
+            scored, signals = extracted
+            parsed = ParsedCell(
+                score=scored.score,
+                signal_type=(
+                    scored.signal_type.value if scored.signal_type else "other"
+                ),
+                rationale="\n\n".join(
+                    s.rationale for s in signals if s.rationale and not s.is_absence
+                )
+                or None,
+                needs_review=scored.needs_review,
+                raw=artifact.cell_value or "",
+            )
+        else:
+            signals = []
+            parsed = parse_cell(artifact.cell_value)
+
         if parsed.score is None:
-            log.debug("no scoreable research", account=account.name)
+            # `info`, not `debug`: this is research we fetched and paid for and
+            # then discarded. At debug it stayed invisible while a format change
+            # silently dropped every prose cell for days.
+            log.info(
+                "no scoreable research",
+                account=account.name,
+                cell_chars=len(artifact.cell_value or ""),
+            )
+            run.cells_unscoreable += 1
             continue
 
         if parsed.score < settings.opportunity_score_threshold:
@@ -137,16 +170,24 @@ async def create_opportunities_for_run(
         headline = f"Qualified signal at {account.name}"
         rationale = parsed.rationale or headline
 
-        # Strong signals earn the expensive LLM pass: the terse evidence-bullet
-        # rationale gets replaced by a version written from Rox's full research
-        # narrative (artifact.raw.output.text), not just the truncated cell_value.
-        # Borderline opportunities keep the cheap version — no call, no latency.
+        # Strong signals earn the expensive LLM pass. Borderline opportunities
+        # keep the cheap version — no call, no latency.
         if parsed.score >= settings.llm_expansion_score_threshold:
-            narrative = ((artifact.raw or {}).get("output") or {}).get("text") or ""
-            expanded = await expand_rationale(account.name, narrative)
-            if expanded is not None:
-                headline = expanded.headline
-                rationale = expanded.rationale
+            if signals:
+                # Elaborate the structured signals rather than re-reading the
+                # raw narrative. Every claim then traces to a typed signal, a
+                # verbatim evidence span and a whitelisted source, and the
+                # extraction pass is not paid for twice over the same prose.
+                brief = await write_brief(account.name, signals)
+                if brief is not None:
+                    headline = brief.headline
+                    rationale = f"{brief.rationale}\n\n{brief.why_now}".strip()
+            else:
+                narrative = ((artifact.raw or {}).get("output") or {}).get("text") or ""
+                expanded = await expand_rationale(account.name, narrative)
+                if expanded is not None:
+                    headline = expanded.headline
+                    rationale = expanded.rationale
 
         opportunity = Opportunity(
             account_id=artifact.account_id,

@@ -90,6 +90,10 @@ class Stage(str, enum.Enum):
     RESEARCHED = "researched"
     OPPORTUNITY_CREATED = "opportunity_created"
     NOTIFIED = "notified"
+    #: Reporting-only: an opportunity is never *stored* at this stage, but the
+    #: funnel needs "a human actually decided" as a step. `notified` only means
+    #: the reviewer was emailed, which overstates review throughput.
+    REVIEWED = "reviewed"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     PROSPECTED = "prospected"
@@ -198,6 +202,11 @@ class ResearchRun(Base):
     cells_fetched: Mapped[int] = mapped_column(Integer, default=0)
     #: refreshes that were accepted but scheduled no cell generation
     cells_timed_out: Mapped[int] = mapped_column(Integer, default=0)
+    #: cells that were fetched but yielded no score, so produced no opportunity.
+    #: Counted because it is otherwise invisible: a research format Rox changes
+    #: under us shows up here as a spike long before anyone notices the queue
+    #: has gone quiet.
+    cells_unscoreable: Mapped[int] = mapped_column(Integer, default=0)
     artifacts_created: Mapped[int] = mapped_column(Integer, default=0)
     opportunities_created: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -428,3 +437,12 @@ class OutreachEmail(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
     enrollment: Mapped[SequenceEnrollment] = relationship(back_populates="emails")
+
+
+# Structured-signal tables live in `app/signals/models.py`. Imported here, at
+# the bottom, so anything that imports `app.models` registers them too —
+# `db.init_db` and the test fixture both call `create_all` off the back of
+# this module, and a table nobody imported is a table `create_all` skips.
+# Bottom placement is required: `signals.models` imports `UtcDateTime` from
+# here, so the names must already be bound when it runs.
+from app.signals import models as _signal_models  # noqa: E402,F401

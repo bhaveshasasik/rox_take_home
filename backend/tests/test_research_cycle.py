@@ -5,6 +5,8 @@ The mock mirrors the real endpoint set: resolve columns from
 work in /priority_jobs, bulk read via /agents/customers_paginated.
 """
 
+from unittest.mock import AsyncMock, patch
+
 import httpx
 import respx
 from sqlalchemy import select
@@ -353,6 +355,65 @@ class TestResearchCycle:
         assert run.cells_fetched > 0, "reads current values without refreshing"
 
 
+class TestExtractionHook:
+    """Structured extraction runs at ingest, behind a flag, and can never
+    take the research cycle down with it."""
+
+    async def test_does_not_run_when_disabled(self, session):
+        from app.signals.models import ArtifactExtraction
+
+        with mock_rox():
+            async with client() as rox:
+                run = await run_research_cycle(session, rox, trigger="manual")
+
+        assert run.status == RunStatus.SUCCEEDED.value
+        rows = (await session.execute(select(ArtifactExtraction))).scalars().all()
+        assert rows == [], "extraction must not run unless EXTRACTION_ENABLED"
+
+    async def test_runs_when_enabled(self, session):
+        from app.signals.models import ArtifactExtraction
+
+        with (
+            mock_rox(),
+            patch("app.services.research.get_settings") as settings,
+        ):
+            settings.return_value = _settings_with(extraction_enabled=True)
+            async with client() as rox:
+                run = await run_research_cycle(session, rox, trigger="manual")
+
+        assert run.status == RunStatus.SUCCEEDED.value
+        rows = (await session.execute(select(ArtifactExtraction))).scalars().all()
+        assert len(rows) == 3, "one extraction per artifact"
+
+    async def test_extraction_failure_does_not_fail_the_run(self, session):
+        """A run that fetched its cells has done its job. Losing that to an
+        extraction problem is strictly worse than having no extraction."""
+        with (
+            mock_rox(),
+            patch("app.services.research.get_settings") as settings,
+            patch(
+                "app.signals.service.extract_run",
+                AsyncMock(side_effect=RuntimeError("extraction exploded")),
+            ),
+        ):
+            settings.return_value = _settings_with(extraction_enabled=True)
+            async with client() as rox:
+                run = await run_research_cycle(session, rox, trigger="manual")
+
+        assert run.status == RunStatus.SUCCEEDED.value
+        assert run.error is None
+        opps = (await session.execute(select(Opportunity))).scalars().all()
+        assert len(opps) == 3, "opportunities still created off the existing path"
+
+
+def _settings_with(**overrides):
+    """Real settings with fields overridden — the cycle reads many of them,
+    so a bare Mock would break unrelated behaviour."""
+    from app.config import get_settings
+
+    return get_settings().model_copy(update=overrides)
+
+
 class TestDedupe:
     async def _seed(self, session, **overrides):
         account = Account(rox_entity_id="e1", name="Acme")
@@ -465,3 +526,55 @@ class TestFullTextIsPreferred:
 
         artifacts = (await session.execute(select(ResearchArtifact))).scalars().all()
         assert artifacts[0].cell_value == "7 — a single terse signal."
+
+
+class TestUnscoreableAreCounted:
+    """Research we fetched and then discarded must not vanish silently.
+
+    A format change on Rox's side once dropped every prose cell for days with
+    nothing but a `debug` line to show for it.
+    """
+
+    async def test_unscoreable_cells_are_counted_on_the_run(self, session):
+        with mock_rox() as router:
+            router.get(url__regex=r".*/research/clever_column/[^/]+/cell/.*").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "cell_value": "",
+                        # prose with no score and no signal bullets
+                        "output": {"type": "text", "text": "No signals were found.", "sources": []},
+                    },
+                )
+            )
+            async with client() as rox:
+                run = await run_research_cycle(session, rox, trigger="manual")
+
+        assert run.cells_fetched == 3, "the cells were fetched"
+        assert run.opportunities_created == 0, "but produced nothing"
+        assert run.cells_unscoreable == 3, "and that gap is recorded"
+
+    async def test_scoreable_cells_do_not_inflate_the_counter(self, session):
+        with mock_rox():
+            async with client() as rox:
+                run = await run_research_cycle(session, rox, trigger="manual")
+
+        assert run.opportunities_created > 0
+        assert run.cells_unscoreable == 0
+
+    async def test_run_health_exposes_the_total(self, session, ):
+        from app.services import reporting
+
+        with mock_rox() as router:
+            router.get(url__regex=r".*/research/clever_column/[^/]+/cell/.*").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"cell_value": "", "output": {"type": "text", "text": "Nothing.", "sources": []}},
+                )
+            )
+            async with client() as rox:
+                await run_research_cycle(session, rox, trigger="manual")
+
+        health = await reporting.run_health(session)
+        assert health["total_cells_unscoreable"] == 3
+        assert health["recent_runs"][0]["cells_unscoreable"] == 3

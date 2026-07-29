@@ -86,7 +86,11 @@ class ProspectingProvider:
         account: Account,
         opportunity: Opportunity,
         contacts: list[ContactCandidate],
+        sources: list[str] | None = None,
     ) -> SequencePlan:
+        """`sources` are citation URLs backing the opportunity, supplied by the
+        caller because only it has a session. None means "not available" and
+        leaves the provider to fall back."""
         raise NotImplementedError
 
 
@@ -137,6 +141,7 @@ class LocalProspectingProvider(ProspectingProvider):
         account: Account,
         opportunity: Opportunity,
         contacts: list[ContactCandidate],
+        sources: list[str] | None = None,
     ) -> SequencePlan:
         label = signal_label(opportunity.signal_type)
         plan = SequencePlan(name=f"{account.name} - {label} outreach")
@@ -216,6 +221,7 @@ class RoxProspectingProvider(ProspectingProvider):
         account: Account,
         opportunity: Opportunity,
         contacts: list[ContactCandidate],
+        sources: list[str] | None = None,
     ) -> SequencePlan:
         """Draft copy locally, then create one Rox sequence per contact."""
         plan = await self._local.build_sequence(account, opportunity, contacts)
@@ -224,7 +230,20 @@ class RoxProspectingProvider(ProspectingProvider):
             log.info("rox writes disabled; sequence drafted locally only")
             return plan
 
-        sources = [s for s in (opportunity.rationale or "").split() if s.startswith("http")]
+        # Citation URLs from the extracted signals when they are available.
+        #
+        # The fallback below scrapes bare `http` tokens out of the rationale,
+        # and it has never produced anything in production: `parse_cell` strips
+        # citations via `_CITATION` before the rationale is written, so zero of
+        # the 21 live opportunities contain the string "http" and every Rox
+        # sequence created so far shipped with `sources: []`.
+        #
+        # Only web citations go to Rox — `rox://contact/<uuid>` refs are
+        # internal CRM pointers, not sources a recipient could follow.
+        if sources is None:
+            sources = [
+                s for s in (opportunity.rationale or "").split() if s.startswith("http")
+            ]
 
         for idx, contact in enumerate(contacts):
             # Never post a fabricated id: rox_person_id is not FK-validated, so
@@ -385,7 +404,14 @@ async def run_prospecting(
 
         opportunity.stage = Stage.PROSPECTED.value
 
-        plan = await provider.build_sequence(account, opportunity, candidates)
+        # Fetched here rather than in the provider: only this layer has a
+        # session. Empty list (not None) when extraction has run and found
+        # nothing, so the provider can tell "no sources" from "not extracted".
+        source_urls = await _citation_urls(session, opportunity.id)
+
+        plan = await provider.build_sequence(
+            account, opportunity, candidates, sources=source_urls
+        )
         sequence.name = plan.name
 
         drafted = 0
@@ -435,6 +461,21 @@ async def run_prospecting(
             "prospecting failed", opportunity_id=opportunity.id, error=str(exc)
         )
         return sequence
+
+
+async def _citation_urls(session: AsyncSession, opportunity_id: str) -> list[str] | None:
+    """Web citations from this opportunity's extracted signals.
+
+    None when nothing has been extracted for it, which leaves the caller on the
+    legacy rationale scrape rather than silently sending an empty list.
+    """
+    from app.signals.schema import SourceKind
+    from app.signals.service import sources_for_opportunity
+
+    refs = await sources_for_opportunity(session, opportunity_id)
+    if not refs:
+        return None
+    return [r.url for r in refs if r.kind is SourceKind.WEB]
 
 
 def _default_provider() -> ProspectingProvider:

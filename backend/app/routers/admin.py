@@ -25,6 +25,8 @@ from app.schemas import (
 )
 from app.services.notifications import notify_opportunity, retry_notification, send_digest
 from app.services.research import run_research_cycle
+from app.signals.schema import ExtractionHealthOut, ExtractionRunOut
+from app.signals.service import extract_run, extraction_health
 
 log = get_logger(__name__)
 router = APIRouter(tags=["admin"])
@@ -92,6 +94,37 @@ async def notify_now(
 async def trigger_digest(session: AsyncSession = Depends(get_session)) -> dict:
     """Email everything currently awaiting review as one digest."""
     return await send_digest(session)
+
+
+@router.post("/admin/signals/extract", response_model=ExtractionRunOut)
+async def extract_signals(
+    run_id: str | None = None,
+    limit: int | None = None,
+    force: bool = False,
+    session: AsyncSession = Depends(get_session),
+) -> ExtractionRunOut:
+    """Run structured extraction over stored research artifacts.
+
+    Deliberately manual. Extraction does not run inside the research cycle
+    yet, so this is the only thing that populates the signal tables — which
+    keeps the LLM cost and the output itself reviewable before either touches
+    the pipeline. Idempotent: artifacts already extracted at the current
+    schema version are skipped unless `force` is set.
+    """
+    return await extract_run(session, run_id=run_id, limit=limit, force=force)
+
+
+@router.get("/admin/signals/health", response_model=ExtractionHealthOut)
+async def signals_health(
+    session: AsyncSession = Depends(get_session),
+) -> ExtractionHealthOut:
+    """Extraction coverage, failure rate, and the signal-type distribution.
+
+    The distribution is the one to watch: it is what
+    `/reporting/signal-performance` will group on, and a collapse into
+    `other` means the categories stopped matching what Rox returns.
+    """
+    return await extraction_health(session)
 
 
 @router.get("/admin/rox/me", response_model=RoxMeOut)

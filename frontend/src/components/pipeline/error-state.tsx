@@ -11,10 +11,13 @@ export function ErrorState({
   error,
   onRetry,
   isRetrying,
+  title = "Failed to load pipeline",
 }: {
   error: unknown;
   onRetry: () => void;
   isRetrying: boolean;
+  /** Override when reused outside the pipeline list, so the copy fits. */
+  title?: string;
 }) {
   const { headline, detail } = describe(error);
 
@@ -29,7 +32,7 @@ export function ErrorState({
         />
       </div>
 
-      <p className="mb-1 text-[13px] font-medium">Failed to load pipeline</p>
+      <p className="mb-1 text-[13px] font-medium">{title}</p>
       <p className="text-muted-foreground max-w-[320px] text-center text-[12px] leading-relaxed">
         {headline}
       </p>

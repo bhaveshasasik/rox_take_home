@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     # LLM rationale expansion
     anthropic_api_key: str = ""
 
+    # Structured signal extraction (app/signals)
+    #: gate for wiring extraction into automatic paths. The admin trigger
+    #: ignores it — that endpoint is the deliberate manual escape hatch.
+    extraction_enabled: bool = False
+    extraction_model: str = "claude-opus-5"
+    #: bump to force re-extraction under a changed schema; rows carry the
+    #: version they were written at, so the two never get compared
+    extraction_schema_version: int = 1
+
     # App
     app_base_url: str = "http://localhost:3000"
     database_url: str = "sqlite+aiosqlite:///./rox_pipeline.db"
@@ -30,6 +39,11 @@ class Settings(BaseSettings):
     # Research cycle
     research_interval_minutes: int = 15
     research_run_on_startup: bool = False
+    #: Set false to keep the API up while stopping the recurring cycle. Needed
+    #: for calibration work: the cycle writes 21 new artifacts every interval
+    #: and creates opportunities off the old scoring path, so any before/after
+    #: comparison drifts underneath you while it runs.
+    research_scheduler_enabled: bool = True
     #: trigger regeneration via refresh_by_tab before reading
     research_refresh_enabled: bool = True
     #: ceiling for waiting on CUSTOM_CELL_GENERATION jobs (~90s per cell)

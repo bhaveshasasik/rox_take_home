@@ -203,6 +203,46 @@ async def wait_for_jobs(rox: RoxClient, run_ids: list[str], timeout: int) -> int
 # ----------------------------------------------------------------------
 
 
+async def _extract_signals(session: AsyncSession, run: ResearchRun) -> None:
+    """Structured extraction over the artifacts this run just wrote.
+
+    Off by default (`EXTRACTION_ENABLED`). Cost scales with how often the cycle
+    actually runs, not with the interval setting: the content-hash cache almost
+    never fires between cycles because Rox regenerates the research text each
+    time — measured at 4% reuse across 432 artifacts — so each cycle pays for a
+    full pass over every account. That is ~21 calls per cycle at present. A
+    couple of cycles a day is unremarkable; a continuously-running 15-minute
+    schedule would be ~84 an hour, which is the case to watch.
+
+    Runs before `create_opportunities_for_run` because scoring now prefers
+    these signals, falling back to `parse_cell` for anything not extracted. An
+    artifact extracted here is scored structurally in the same cycle.
+
+    Never raises. A research run that fetched its cells has done its job, and
+    losing that to an extraction problem would be a strictly worse outcome
+    than having no extraction at all.
+    """
+    if not get_settings().extraction_enabled:
+        return
+
+    from app.signals.service import extract_run as extract_artifacts
+
+    try:
+        stats = await extract_artifacts(session, run_id=run.id)
+    except Exception as exc:  # noqa: BLE001 - the cycle must survive this
+        log.error("extraction pass failed", run_id=run.id, error=str(exc)[:500])
+        return
+
+    log.info(
+        "extraction pass complete",
+        run_id=run.id,
+        extracted=stats.extracted,
+        reused=stats.reused,
+        failed=stats.failed,
+        signals=stats.signals,
+    )
+
+
 async def run_research_cycle(
     session: AsyncSession,
     rox: RoxClient,
@@ -312,6 +352,8 @@ async def run_research_cycle(
                 run.artifacts_created += 1
 
         await session.commit()
+
+        await _extract_signals(session, run)
 
         if create_opportunities:
             from app.services.opportunities import create_opportunities_for_run

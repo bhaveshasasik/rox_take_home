@@ -37,9 +37,15 @@ async def scheduled_research_cycle() -> None:
         log.error("scheduled research cycle failed", error=str(exc))
 
 
-def start_scheduler() -> AsyncIOScheduler:
+def start_scheduler() -> AsyncIOScheduler | None:
     global _scheduler
     settings = get_settings()
+
+    if not settings.research_scheduler_enabled:
+        # Logged at warning: an app silently not doing its recurring job looks
+        # identical to one whose job is failing.
+        log.warning("scheduler disabled by RESEARCH_SCHEDULER_ENABLED")
+        return None
 
     if _scheduler is not None and _scheduler.running:
         return _scheduler

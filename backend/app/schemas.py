@@ -16,6 +16,11 @@ from app.models import (
     SequenceStatus,
     Stage,
 )
+from app.signals.schema import (
+    ExtractedSignalOut,
+    ScoreBreakdownOut,
+    SourceRefOut,
+)
 
 
 class ORMModel(BaseModel):
@@ -91,6 +96,8 @@ class ResearchRunOut(ORMModel):
     accounts_scanned: int
     cells_fetched: int
     cells_timed_out: int
+    #: fetched but unscoreable — research that produced no opportunity
+    cells_unscoreable: int
     artifacts_created: int
     opportunities_created: int
     error: str | None = None
@@ -146,6 +153,16 @@ class OpportunityDetailOut(OpportunityOut):
     decision: DecisionOut | None = None
     notifications: list[NotificationOut] = Field(default_factory=list)
     has_sequence: bool = False
+    #: Structured signals from `app/signals`, when this opportunity's research
+    #: has been extracted. Empty means not-yet-extracted, not no-signals — the
+    #: regex-parsed `research[].signals` above is still the live path.
+    extracted_signals: list[ExtractedSignalOut] = Field(default_factory=list)
+    #: What the extracted signals would score, with per-factor contributions.
+    #: Null until extraction runs; never null-because-zero.
+    score_breakdown: ScoreBreakdownOut | None = None
+    #: Deduped citations across the extracted signals, strongest first. The
+    #: existing path strips these, so they appear only once extracted.
+    sources: list[SourceRefOut] = Field(default_factory=list)
 
 
 class OpportunityListOut(BaseModel):
@@ -378,6 +395,7 @@ class RecentRunOut(BaseModel):
     duration_seconds: float | None = None
     accounts_scanned: int
     cells_fetched: int
+    cells_unscoreable: int
     opportunities_created: int
 
 
@@ -385,6 +403,7 @@ class RunHealthOut(BaseModel):
     runs_considered: int
     success_rate: float
     total_cells_fetched: int
+    total_cells_unscoreable: int
     recent_runs: list[RecentRunOut]
 
 
