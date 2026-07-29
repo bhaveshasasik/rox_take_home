@@ -1,8 +1,9 @@
 # Rox Opportunity Pipeline — Backend
 
-End-to-end **Opportunity → Qualified** pipeline over the Rox API: periodic
-account research, scored opportunities, human accept/reject, automated
-prospecting into real Rox sequences, and in-app reporting.
+End-to-end **Opportunity → Qualified** pipeline over the Rox API: daily
+account research, LLM-extracted signals, scored opportunities, a single
+review digest, human accept/reject, automated prospecting into real Rox
+sequences, and in-app reporting.
 
 ## Quick start
 
@@ -16,33 +17,38 @@ cp .env.example .env          # fill in ROX_API_TOKEN
 Swagger UI: http://localhost:8000/docs
 
 ```bash
-.venv/bin/python -m pytest -q      # 149 tests, Rox mocked via respx
+.venv/bin/python -m pytest -q      # 253 tests, Rox and Anthropic mocked
 ```
 
-Trigger a cycle without waiting for the scheduler:
+Trigger a cycle without waiting for the daily schedule — the demo path:
 
 ```bash
-curl -X POST localhost:8000/admin/research/run
+curl -X POST "localhost:8000/admin/research/run?force_extract=true&ignore_cooldown=true"
 ```
 
 ## How it works
 
 ```
- scheduler (APScheduler, every RESEARCH_INTERVAL_MINUTES)
-      │
+ scheduler (APScheduler, cron — daily at RESEARCH_RUN_AT, UTC)
+      │     startup reaper marks orphaned "running" runs failed;
+      │     a lost same-day scheduled run triggers a catch-up
       ▼
  run_research_cycle ──► sync accounts       GET  /hierarchy/customers
-      │                 resolve columns     GET  /account_research/account_research_section
+      │                 resolve column      GET  /account_research/account_research_section
       │                 trigger refresh     POST /research/clever_column/{col}/refresh_by_tab/{org}
       │                 wait for jobs       GET  /priority_jobs
-      │                 bulk read           GET  /agents/customers_paginated/{col}
-      │                 persist ResearchArtifacts
+      │                 per-account read    GET  /research/clever_column/{col}/cell/{entity}
+      │                 persist ResearchArtifacts (full output.text narrative)
       ▼
- create_opportunities ─► parse cells → score → dedupe → Opportunity
+ signal extraction ────► one LLM pass per cell (app/signals): typed signals,
+      │                  verbatim evidence, whitelisted sources, 0-100 score
+      ▼
+ create_opportunities ─► score → dedupe/supersede → Opportunity
       │
       ▼
- notify_opportunity ───► Slack webhook + SMTP email, with a deep link
-      │
+ send_digest ──────────► ONE email per producing run (SMTP): account, signal
+      │                  label, score, review link — structured values only,
+      │                  membership recorded for dedupe
       ▼
  [human] POST /opportunities/{id}/decision   accept | reject (+ reason)
       │
@@ -53,47 +59,74 @@ curl -X POST localhost:8000/admin/research/run
  /reporting/*  ────────► funnel, calibration, latency, coverage, yield
 ```
 
-~6 Rox requests per cycle for 3 columns, versus ~66 with per-entity cell polling.
+Reads are per-account rather than bulk because only the per-entity endpoint
+returns `output.text` — the full research narrative; the bulk endpoint caps
+cells at ~300 characters and truncates mid-sentence.
 
-### Research columns
+### Research column
 
-Columns are **authored in the Rox UI** and referenced by name in
-[`app/services/research_columns.py`](app/services/research_columns.py). Columns
-created through the API never generate cells — reproducible via
-[`scripts/probe_column_generation.py`](scripts/probe_column_generation.py), and
-documented in [`.claude/skills/rox-api/SKILL.md`](../.claude/skills/rox-api/SKILL.md).
+The pipeline reads one Rox column, **authored in the Rox UI** and referenced
+by name in
+[`app/services/research_columns.py`](app/services/research_columns.py) —
+columns created through the API never generate cells (reproducible via
+[`scripts/probe_column_generation.py`](scripts/probe_column_generation.py)).
 
 | key | Rox column | role |
 |---|---|---|
-| `opportunity_signal` | Opportunity Signal | SCORE (0-10 → ×10) |
-| `risk_signal` | Risk Signal | MODIFIER, inverted |
-| `engagement_recency` | Engagement Recency | CONTEXT |
-| `key_contacts` | Key Contacts | CONTEXT |
+| `opportunity_signal` | Opportunity-Signal Research | the scored research narrative |
 
-**To change the signals**, edit `COLUMN_REFS` — or set `RESEARCH_COLUMNS` in
-`.env` to a comma-separated list of Rox column names. Unknown names are added as
-`CONTEXT`, so trialling a new column can't perturb scores. Nothing else changes:
-`research.py` fetches whatever is listed and `score_account` scores from the
-declared roles.
+To trial other columns, set `RESEARCH_COLUMNS` in `.env` to a comma-separated
+list of Rox column names; unknown names are fetched but never perturb scores.
 
 ### Scoring
 
-`parse_cell` handles the live `"7 — <rationale>"` / `"Low - <rationale>"` format
-and normalizes against each column's declared `scale` — Rox emits **0-10**, so a
-raw `7` must become `70`; parsing it as 7/100 silently drops every opportunity
-below threshold.
+The primary path is structured extraction (`app/signals`): one LLM pass per
+research cell returns typed signals — a fixed seven-value vocabulary,
+confidence 0-10, an explicit absence flag, and a verbatim evidence span that
+is validated against the source text. Scoring composes those into a 0-100
+total with a stored factor breakdown; absences, contested signals, and
+out-of-category context score zero by construction. Extraction runs inside
+the scheduled cycle (`EXTRACTION_ENABLED`, on by default — one run per day is
+~21 LLM calls plus a ~33% retry overhead).
 
-`score_account` is the policy seam and is expected to change: `SCORE` columns set
-the base, `MODIFIER` columns adjust it within bounds, `CONTEXT` columns never
-affect it. Its tests assert *properties* (ordering, direction), not exact numbers.
+The regex parser (`app/services/parsing.py`) survives only as the fallback
+for artifacts that have never been extracted.
 
-### Dedupe
+### Dedupe and superseding
 
-Research is recurring, so the same signal resurfaces every run. An opportunity is
-skipped if the account already has an undecided one, or if one was decided within
-`OPPORTUNITY_COOLDOWN_DAYS`. Deduping is per **account**, not per signal type —
-`signal_type` is derived from rationale text and can drift between runs for the
-same underlying signal.
+Research recurs, so the same signal resurfaces every run. An account is
+skipped if it was decided within `OPPORTUNITY_COOLDOWN_DAYS`, or if it holds
+an undecided opportunity — unless the new score clears the open one by 15
+points, in which case the open opportunity is closed as **superseded** and
+the stronger one takes its place. Superseded is terminal but carries no
+decision: it never appears in acceptance rates, rejection reasons, or the
+review queue. Deduping is per **account**, not per signal type.
+
+Future work, deliberately not built: expiring stale unreviewed opportunities
+on a timer. Superseding covers the case that actually deadlocks the pipeline
+(a low score blocking its account forever); general expiry is policy the
+demo doesn't need.
+
+### Notifications
+
+One **digest per producing run**, email only — there is no Slack integration.
+Each entry is structured values end to end: account name, primary signal
+label (the scoring driver), score, review link, plus a link to the pipeline
+pre-filtered to the digest's own view. No LLM-generated prose can reach the
+email.
+
+Two thresholds, kept separate on purpose:
+
+- `OPPORTUNITY_SCORE_THRESHOLD` (60) gates **creation** — what enters the
+  pipeline at all.
+- `NOTIFICATION_SCORE_THRESHOLD` (80) gates **digest inclusion** — what is
+  worth a reviewer's inbox. Sub-80 opportunities exist in the pipeline UI,
+  are never emailed, and can still supersede or be superseded.
+
+Every digest records its membership (`digests` / `digest_opportunities`), and
+eligibility is one shared query: at/above the notification floor, undecided,
+and not a member of any prior digest that was or may still be delivered.
+Running the digest twice sends nothing the second time.
 
 ## API
 
@@ -102,9 +135,9 @@ same underlying signal.
 | GET | `/health` | status, scheduler, next run, channel config |
 | GET | `/accounts`, POST `/accounts/sync` | target accounts |
 | GET | `/opportunities` | list + filter (status, stage, signal, score, search, sort, paging) |
-| GET | `/opportunities/{id}` | detail incl. supporting research + decision |
+| GET | `/opportunities/{id}` | detail incl. research, extracted signals, score breakdown |
 | POST | `/opportunities/{id}/decision` | accept / reject; accept triggers prospecting |
-| POST | `/opportunities/{id}/notify` | re-send notification |
+| POST | `/opportunities/{id}/notify` | re-send a single notification |
 | GET | `/prospecting/sequences` | all sequences |
 | GET | `/prospecting/opportunities/{id}` | contacts, enrollments, generated emails |
 | POST | `/prospecting/opportunities/{id}/run` | retry prospecting |
@@ -113,7 +146,10 @@ same underlying signal.
 | GET | `/opportunities/stats` | pending + aging counts for the pipeline header |
 | GET | `/research/runs`, `/research/columns` | automation visibility |
 | GET | `/notifications`, POST `/notifications/{id}/retry` | delivery audit + retry |
-| POST | `/admin/research/run` | trigger a cycle now |
+| POST | `/admin/research/run` | trigger a cycle now; `force_extract` / `ignore_cooldown` per-run overrides, recorded on the run row |
+| POST | `/admin/notifications/digest` | send the digest now (membership-deduped) |
+| POST | `/admin/signals/extract` | run extraction over stored artifacts |
+| GET | `/admin/signals/health` | extraction coverage and yield tripwires |
 | GET | `/admin/rox/me` | Rox connectivity check |
 
 Every database-backed report accepts an optional `start`/`end` window, half-open
@@ -133,37 +169,43 @@ own `lookback_hours`. Two reports take an extra knob:
 
 | Report | Business question |
 |---|---|
-| Funnel | Where do opportunities die? Stage attainment derives from facts (was it notified? does it have contacts?) not the mutable `stage` column, so rejections are counted at the stages they *did* reach and conversion isn't flattered. |
-| **Score calibration** | Is the score predictive? Acceptance rate per score band — a flat line means the score is decoration. |
+| Funnel | Where do opportunities die? Stage attainment derives from facts (was it notified? does it have contacts?) not the mutable `stage` column, so rejections — and superseded rows — are counted at the stages they *did* reach and conversion isn't flattered. |
+| **Score calibration** | Is the score predictive? Acceptance rate per score band — a flat line means the score is decoration. Superseded rows never count as decided. |
 | Signal performance | Which signals produce opportunities people accept? |
 | Decision latency | Is human review the bottleneck? (median / p90). Timed from `notified_at` where available, falling back to `created_at` for opportunities decided without ever being notified — otherwise the metric silently reports null whenever notifications are misconfigured, which reads as "no decisions" rather than "not measurable". `measured` vs `count` tells the two apart, and `from_notification` / `from_creation` say which basis produced the number. |
 | Rejection reasons | What to fix upstream — e.g. lots of `already_engaged` ⇒ dedupe against CRM first. |
 | Account coverage | Which target accounts are we ignoring entirely? |
 | Prospecting yield | Does an accept reliably become real outreach? |
-| Run health / job telemetry | Is the automation healthy? `cells_unscoreable` counts research that was fetched and then discarded — a rising share means Rox is returning a shape the parser no longer reads, which is otherwise invisible. `job-telemetry` reads Rox's own task queue live. |
+| Run health / job telemetry | Is the automation healthy? `cells_unscoreable` counts research that was fetched and then discarded — a rising share means Rox is returning a shape the parser no longer reads. Orphaned "running" rows are reaped at startup and marked failed with a reason naming the reaper; forced runs carry their overrides so their numbers don't read as trend. `job-telemetry` reads Rox's own task queue live. |
 
 ## Configuration
 
 See [`.env.example`](.env.example). Notable knobs:
 
-- `RESEARCH_INTERVAL_MINUTES` — scheduler cadence
+- `RESEARCH_RUN_AT` — daily run time, `HH:MM` UTC (default `07:00`). Invalid
+  values fail startup rather than silently degrade. Blank falls back to…
+- `RESEARCH_INTERVAL_MINUTES` — legacy interval cadence, kept for calibration
+  work only
+- `EXTRACTION_ENABLED` — structured extraction inside the cycle (default on)
+- `OPPORTUNITY_SCORE_THRESHOLD` / `NOTIFICATION_SCORE_THRESHOLD` — creation
+  vs digest-inclusion floors; see Notifications for why they differ
+- `OPPORTUNITY_COOLDOWN_DAYS` — re-surfacing window after a decision
 - `RESEARCH_REFRESH_ENABLED` — trigger regeneration before reading; set `false` for a fast read-only run
 - `RESEARCH_COLUMNS` — override the column registry by name
 - `ROX_ORG_ID` — the `refresh_by_tab` tab id; auto-discovered from `/priorities` when blank
 - `ROX_WRITES_ENABLED` — create real DRAFT sequences in Rox on accept
-- `OPPORTUNITY_SCORE_THRESHOLD` / `OPPORTUNITY_COOLDOWN_DAYS`
-- `SLACK_WEBHOOK_URL`, `SMTP_*` — channels activate only when configured
+- `SMTP_*`, `NOTIFY_EMAIL_TO` — email activates only when configured; there
+  is no other channel
 
 ## Known gaps
 
-1. **Opportunity titles and outreach copy are assembled by string manipulation**
-   (`clean_headline`, `_lede`, `_supporting_evidence` in
-   [`prospecting.py`](app/services/prospecting.py)). This is the weakest part of
-   the codebase and the natural place for an LLM to write the headline and email
-   body from the research instead.
-2. **No auth** on our own API; single-user demo (assignee from `/user/me`).
-3. **Emails are drafted into Rox as DRAFT sequences, not sent.** Rox does not
+1. **No auth** on our own API; single-user demo (assignee from `/user/me`).
+2. **Emails are drafted into Rox as DRAFT sequences, not sent.** Rox does not
    author the body — `campaign_request_public_id` is silently dropped on write
    and there is no campaign generate trigger, so the copy is ours.
-4. **`ResearchArtifact` rows accumulate per run.** Fine at 21 accounts × 3
-   columns; would need pruning at scale.
+3. **`ResearchArtifact` rows accumulate per run.** Fine at 21 accounts;
+   would need pruning at scale.
+4. **`force_extract` cannot bypass the content-hash twin lookup** — an
+   artifact whose text matches another's completed extraction copies rows
+   instead of calling the model (~4% of cells). Force does not strictly mean
+   "call the model".
