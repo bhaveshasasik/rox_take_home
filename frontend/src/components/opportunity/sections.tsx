@@ -337,7 +337,21 @@ export function ResearchSummary({
   if (extractedSignals.length > 0) {
     const fetchedAt = (research ?? [])[0]?.fetched_at;
     const columnName = (research ?? [])[0]?.column_name;
-    const shown = expanded ? extractedSignals : extractedSignals.slice(0, RESEARCH_PREVIEW);
+    // `other` is the dismissed bucket — firmographics and reporting cadence —
+    // and scores nothing by definition. Left in server rank it fills the whole
+    // preview: Cisco's top three were a headquarters address, a website and an
+    // industry description, with every real finding behind the toggle.
+    //
+    // Deranked here rather than filtered: this section is the one place that
+    // lists every finding, and the rail beside it already drops `other`.
+    // A stable sort on that single key leaves the server's ranking — absence,
+    // then confidence, then emitted position — intact underneath, so display
+    // order stays a strict refinement of the order scoring and the brief read.
+    // Copied first because the array belongs to the query cache.
+    const ranked = [...extractedSignals].sort(
+      (a, b) => Number(a.signal_type === "other") - Number(b.signal_type === "other"),
+    );
+    const shown = expanded ? ranked : ranked.slice(0, RESEARCH_PREVIEW);
 
     return (
       <section className="px-6 py-5">
