@@ -376,6 +376,68 @@ function groupRows(signals: ExtractedSignal[]): ExtractedSignal[][] {
   return rows;
 }
 
+/** One rendered block: a category heading over the findings filed under it. */
+interface Section {
+  key: string;
+  label: string;
+  /** Carries the badge state — every finding in a section shares it. */
+  lead: ExtractedSignal;
+  /** Each entry is a group of signals quoting one span. */
+  findings: ExtractedSignal[][];
+}
+
+/**
+ * Findings collapsed into one block per category.
+ *
+ * A row was previously one signal, so an account with several distinct
+ * findings in the same category printed the heading once per finding — Meta
+ * showed four separate "Growth / Expansion" blocks and five "Trigger Event"
+ * ones. The findings are genuinely different (revenue, product usage, ads
+ * run-rate, compute scaling), so they cannot be deduplicated; they just belong
+ * under one heading rather than repeating it.
+ *
+ * Absences and contested findings stay whole. Both already carry a
+ * multi-category label — one span filed under several categories at once —
+ * so bucketing them by a single type would either split a row that is
+ * deliberately one thing, or file it under an arbitrary member of its list.
+ */
+function groupSections(rows: ExtractedSignal[][]): Section[] {
+  const sections: Section[] = [];
+  const byType = new Map<string, Section>();
+
+  for (const row of rows) {
+    const [lead] = row;
+
+    if (lead.is_absence || lead.contested) {
+      sections.push({
+        key: lead.id,
+        label: row.map((signal) => signal.label).join(" · "),
+        lead,
+        findings: [row],
+      });
+      continue;
+    }
+
+    const existing = byType.get(lead.signal_type);
+    if (existing) {
+      existing.findings.push(row);
+      continue;
+    }
+    // `lead.label` is this type's own label — not the row's joined one, which
+    // would name a second category the rest of the section does not share.
+    const created: Section = {
+      key: lead.signal_type,
+      label: lead.label,
+      lead,
+      findings: [row],
+    };
+    byType.set(lead.signal_type, created);
+    sections.push(created);
+  }
+
+  return sections;
+}
+
 /**
  * Extracted signals as labelled sections, each with the citations backing it.
  *
@@ -408,78 +470,96 @@ export function ResearchSummary({
     const ranked = [...extractedSignals].sort(
       (a, b) => Number(a.signal_type === "other") - Number(b.signal_type === "other"),
     );
-    const rows = groupRows(ranked);
-    const shown = expanded ? rows : rows.slice(0, RESEARCH_PREVIEW);
+    const sections = groupSections(groupRows(ranked));
+    const shown = expanded ? sections : sections.slice(0, RESEARCH_PREVIEW);
 
     return (
       <section className="px-6 py-5">
         <SectionLabel>Research summary</SectionLabel>
         <div className="space-y-5">
-          {shown.map((row) => {
-            // Every member of a group quotes the same span, and sources are
-            // resolved from that span, so the lead's are the whole row's.
-            const [lead] = row;
-            const sources = lead.sources ?? [];
-            const label = row.map((signal) => signal.label).join(" · ");
-
-            return (
-              <article key={lead.id} className="border-border border-b pb-5 last:border-0 last:pb-0">
-                <div className="mb-1.5 flex items-center justify-between gap-3">
-                  <span className="flex min-w-0 items-center gap-1.5">
-                    {/* Six categories over one span outruns the column, so the
-                        full list stays reachable on hover. */}
-                    <span className="truncate text-[12px] font-medium" title={label}>
-                      {label}
-                    </span>
-                    {lead.is_absence && (
-                      <span className="text-muted-foreground shrink-0 text-[10px]">
-                        nothing found
-                      </span>
-                    )}
-                    {lead.contested && (
-                      <span className="text-age-overdue shrink-0 text-[10px]">disputed</span>
-                    )}
-                    {looksMalformed(lead.evidence) && (
-                      <span
-                        className="text-age-overdue shrink-0 text-[10px]"
-                        title="The source research contains markup or structured-data fragments. Read this evidence with care."
-                      >
-                        malformed source
-                      </span>
-                    )}
+          {shown.map((section) => (
+            <article
+              key={section.key}
+              className="border-border border-b pb-5 last:border-0 last:pb-0"
+            >
+              <div className="mb-1.5 flex items-center justify-between gap-3">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  {/* Six categories over one span outruns the column, so the
+                      full list stays reachable on hover. */}
+                  <span className="truncate text-[12px] font-medium" title={section.label}>
+                    {section.label}
                   </span>
-                  <div className="text-muted-foreground flex shrink-0 items-center gap-1.5 text-[10px]">
-                    <SourceLinks sources={sources} />
-                    {fetchedAt && (
-                      <>
-                        {sources.some((s) => s.kind === "web") && (
-                          <span className="text-border">·</span>
-                        )}
-                        <span className="font-mono" title={absoluteTime(fetchedAt)}>
-                          {formatAge(fetchedAt)} ago
-                        </span>
-                      </>
-                    )}
-                  </div>
-                </div>
-                {/* The verbatim span only. The per-signal rationale is generated
-                    prose and cannot be checked against the source, so it is not
-                    shown here — evidence can be, and is. */}
-                {/* A grouped row passes no label: `readable` strips a leading
-                    category prefix, and only the lead's would ever match. */}
-                <Evidence
-                  text={lead.evidence}
-                  label={row.length === 1 ? lead.label : undefined}
-                />
-              </article>
-            );
-          })}
+                  {section.findings.length > 1 && (
+                    <span className="text-muted-foreground shrink-0 text-[10px]">
+                      {section.findings.length} findings
+                    </span>
+                  )}
+                  {section.lead.is_absence && (
+                    <span className="text-muted-foreground shrink-0 text-[10px]">
+                      nothing found
+                    </span>
+                  )}
+                  {section.lead.contested && (
+                    <span className="text-age-overdue shrink-0 text-[10px]">disputed</span>
+                  )}
+                </span>
+                {fetchedAt && (
+                  <span
+                    className="text-muted-foreground shrink-0 font-mono text-[10px]"
+                    title={absoluteTime(fetchedAt)}
+                  >
+                    {formatAge(fetchedAt)} ago
+                  </span>
+                )}
+              </div>
+
+              {/* One entry per finding. Sources sit with the span they back
+                  rather than on the heading — a category can hold several
+                  findings drawn from different citations. */}
+              <div className="space-y-3">
+                {section.findings.map((row) => {
+                  // Every member of a row quotes the same span, and sources are
+                  // resolved from that span, so the lead's are the row's.
+                  const [lead] = row;
+                  const sources = lead.sources ?? [];
+
+                  return (
+                    <div key={lead.id}>
+                      {/* The verbatim span only. The per-signal rationale is
+                          generated prose and cannot be checked against the
+                          source, so it is not shown — evidence can be, and is. */}
+                      {/* A grouped row passes no label: `readable` strips a
+                          leading category prefix, and only the lead's would
+                          ever match. */}
+                      <Evidence
+                        text={lead.evidence}
+                        label={row.length === 1 ? lead.label : undefined}
+                      />
+                      {(sources.length > 0 || looksMalformed(lead.evidence)) && (
+                        <div className="text-muted-foreground mt-1 flex items-center gap-1.5 text-[10px]">
+                          <SourceLinks sources={sources} />
+                          {looksMalformed(lead.evidence) && (
+                            <span
+                              className="text-age-overdue shrink-0"
+                              title="The source research contains markup or structured-data fragments. Read this evidence with care."
+                            >
+                              malformed source
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </article>
+          ))}
         </div>
         <MoreToggle
-          hidden={rows.length - shown.length}
+          hidden={sections.length - shown.length}
           expanded={expanded}
           onToggle={() => setExpanded((v) => !v)}
-          noun="finding"
+          noun="category"
         />
         {columnName && (
           <p className="text-muted-foreground/70 mt-4 text-[10px]">Source: {columnName}</p>
