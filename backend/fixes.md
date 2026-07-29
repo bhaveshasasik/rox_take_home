@@ -236,8 +236,34 @@ Backend, in one commit:
 - Bump SCHEMA_VERSION to 2, re-extract all artifacts, regenerate the frontend
   types
 
-Baseline every score before re-extraction and diff after. Report the diff; do
-not silently re-baseline.
+ABSENCE VERIFICATION — replace contests_absence, do not extend it
+
+`contests_absence` under-detects, and the miss is already scoring. Three Abbott
+signals quote "Because those items are absent from the internal dataset, no
+confidence-rated buying-intent, champion..." with is_absence=0 AND contested=0,
+at confidence 8 on three scoring categories. Abbott scores 95.
+
+Two independent failures stacked:
+- `_ABSENCE_ASSERTION` has no pattern for "absent" in any form
+- its `no <up to 3 words> <noun>` branch should have matched "no
+  confidence-rated buying-intent, champion" — `champions?` is in the noun list
+  — but `[a-z][a-z-]*\s+` cannot consume "buying-intent," because of the comma
+
+Replace the regex with a cheap model call over the evidence span: does this
+span assert that something was NOT found? Binary, low effort, no reasoning.
+
+- Run it only where is_absence=false and signal_type != other. Everything else
+  either already reports an absence or cannot score.
+- On disagreement set contested=true, exactly as today. Do not auto-flip
+  is_absence — withholding from the score is the protection needed, and
+  rewriting the model's own output on an automated second opinion is a larger
+  change than this checklist should make.
+- Delete `_ABSENT_NOUNS` and `_ABSENCE_ASSERTION` with it. Keeping a
+  hand-maintained noun list beside a model check gives two sources of truth
+  and no way to tell which one failed.
+
+Report the contested rate before and after. It was 41/622 = 6.6% under the
+regex, which is a floor, not a measurement — the Abbott rows show it misses.
 ```
 
 Rationale was the last generated field on a signal, and the only one that could
@@ -251,11 +277,41 @@ changes.
 account do not drop materially — a large fall means the shortened prompt lost
 coverage, not that the cells changed.
 
+**Regression target:** Abbott's three signals over the "absent from the
+internal dataset" span must come back either `is_absence=true` or
+`contested=true`. If they return unflagged again, the absence verification did
+not land and nothing else in this prompt matters. This is the specific case to
+check first, before reading the score diff.
+
 **Score movement is expected here, unlike everywhere else in this document.**
 A schema bump forces re-extraction, and a re-run can legitimately return a
 different signal set. Diff the scores, review the movement account by account,
 and accept it deliberately. Do not treat a moved score as an automatic revert —
 and do not skip the diff because movement is expected.
+
+---
+
+## Known bad row — Abbott
+
+Abbott is **accepted** at a score of 95, built on three signals whose own
+evidence says the findings are absent. `needs_review` was already 1; it was
+accepted anyway, which is worth knowing on its own — the flag did not change
+the outcome.
+
+Nothing in this checklist corrects it, deliberately. Every script here skips
+decided opportunities because rewriting the evidence behind a decision
+falsifies the record, and that reasoning does not weaken just because the
+decision looks wrong in hindsight. Prompt 9 will re-extract the artifact and
+fix the *signals*; the opportunity keeps its score and its acceptance.
+
+Correcting the decision is a product call, not a migration:
+
+- leave it, and let the re-extracted signals disagree with the stored score
+- re-open it for review, which means reversing an accept a human made
+- record a correction alongside it rather than overwriting either
+
+Pick one deliberately. Do not let a backfill make the choice silently by
+running with `--include-decided`.
 
 ---
 
