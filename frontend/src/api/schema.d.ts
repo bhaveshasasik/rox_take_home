@@ -441,7 +441,18 @@ export interface paths {
         put?: never;
         /**
          * Trigger Research
-         * @description Run one research cycle now. Each opportunity notifies as it's created.
+         * @description Run one research cycle now; qualifying opportunities notify in batch.
+         *
+         *     Per-run overrides, recorded on the run row and never persisted anywhere
+         *     else:
+         *     - `force_extract` bypasses the settled-row skip in extract_artifact, so
+         *       already-extracted artifacts re-extract. Known limit: it cannot bypass
+         *       the content-hash twin lookup — an artifact whose text matches another's
+         *       OK extraction copies rows instead of calling the model (~4% of cells),
+         *       so force does not strictly mean "call the model".
+         *     - `ignore_cooldown` skips the recently-decided cooldown for this run
+         *       only. The open-opportunity guard still applies; superseding is the
+         *       sanctioned way past it.
          */
         post: operations["trigger_research_admin_research_run_post"];
         delete?: never;
@@ -495,7 +506,12 @@ export interface paths {
         put?: never;
         /**
          * Notify Now
-         * @description Re-send the notification for one opportunity.
+         * @description Notify about one opportunity; re-sending requires `force=true`.
+         *
+         *     Without the guard this endpoint notified the same opportunity repeatedly,
+         *     inserting a fresh Notification row each time. A resend is recorded like
+         *     any send but never overwrites the original `notified_at` — decision
+         *     latency is measured from the first delivery.
          */
         post: operations["notify_now_opportunities__opportunity_id__notify_post"];
         delete?: never;
@@ -1120,6 +1136,8 @@ export interface components {
             id: string;
             /** Trigger */
             trigger: string;
+            /** Overrides */
+            overrides?: string | null;
             status: components["schemas"]["RunStatus"];
             /**
              * Started At
@@ -2148,6 +2166,8 @@ export interface operations {
         parameters: {
             query?: {
                 notify?: boolean;
+                force_extract?: boolean;
+                ignore_cooldown?: boolean;
             };
             header?: never;
             path?: never;
@@ -2240,7 +2260,9 @@ export interface operations {
     };
     notify_now_opportunities__opportunity_id__notify_post: {
         parameters: {
-            query?: never;
+            query?: {
+                force?: boolean;
+            };
             header?: never;
             path: {
                 opportunity_id: string;
