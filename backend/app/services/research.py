@@ -24,6 +24,7 @@ Two facts drive the design:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -243,6 +244,89 @@ async def _extract_signals(
         failed=stats.failed,
         signals=stats.signals,
     )
+
+
+#: A run still "running" after this long is an orphan, not work in progress.
+#: Picked from observed durations: the longest clean run on record is 851s
+#: (extraction included), so an hour is ~4x headroom — and it matches the
+#: frontend's stuck badge, so the reaper and the UI agree on what stuck means.
+#: (The 490s figure in the build notes predates extraction in the cycle.)
+STUCK_RUN_SECONDS = 60 * 60
+
+
+async def reap_stuck_runs(session: AsyncSession) -> list[ResearchRun]:
+    """Mark orphaned "running" rows failed, and say why.
+
+    A permanently-running row means the process died mid-run — the cycle's
+    own except-path closes the row on any error it can see, so only a kill
+    can strand one. Without this, orphans sit in run health forever, dragging
+    the success rate and wearing the stuck badge for weeks at daily cadence.
+
+    The error text names the reaper: an operator reading run health must be
+    able to tell "the process died under this run" from "the run itself
+    failed".
+    """
+    cutoff = utcnow() - timedelta(seconds=STUCK_RUN_SECONDS)
+    stranded = (
+        (
+            await session.execute(
+                select(ResearchRun).where(
+                    ResearchRun.status == RunStatus.RUNNING.value,
+                    ResearchRun.started_at < cutoff.replace(tzinfo=None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for run in stranded:
+        run.status = RunStatus.FAILED.value
+        run.finished_at = utcnow()
+        run.error = (
+            f"reaped at startup: still 'running' {STUCK_RUN_SECONDS}s after "
+            "starting — the process died mid-run, the run itself did not fail"
+        )
+        log.warning(
+            "stuck run reaped",
+            run_id=run.id,
+            trigger=run.trigger,
+            started_at=str(run.started_at),
+        )
+
+    if stranded:
+        await session.commit()
+    return stranded
+
+
+async def needs_same_day_retry(
+    session: AsyncSession, reaped: list[ResearchRun]
+) -> bool:
+    """True when today's scheduled run died and nothing succeeded since.
+
+    At daily cadence a lost run is a lost day; a reaped run from a previous
+    day is history, not a gap — the next cron fire covers it.
+    """
+    today = utcnow().date()
+    lost_today = any(
+        run.trigger == "scheduled" and run.started_at.date() == today
+        for run in reaped
+    )
+    if not lost_today:
+        return False
+
+    succeeded_today = (
+        await session.execute(
+            select(ResearchRun.id)
+            .where(
+                ResearchRun.status == RunStatus.SUCCEEDED.value,
+                ResearchRun.started_at
+                >= datetime.combine(today, time.min),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return succeeded_today is None
 
 
 async def run_research_cycle(

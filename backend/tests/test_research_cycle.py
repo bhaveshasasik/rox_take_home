@@ -716,3 +716,85 @@ class TestUnscoreableAreCounted:
         health = await reporting.run_health(session)
         assert health["total_cells_unscoreable"] == 3
         assert health["recent_runs"][0]["cells_unscoreable"] == 3
+
+
+class TestStuckRunReaper:
+    async def _run(self, session, *, status, started_ago_s, trigger="scheduled"):
+        from datetime import timedelta
+
+        run = ResearchRun(
+            trigger=trigger,
+            status=status,
+            started_at=(utcnow() - timedelta(seconds=started_ago_s)).replace(tzinfo=None),
+        )
+        session.add(run)
+        await session.commit()
+        return run
+
+    async def test_reaps_only_stale_running_rows(self, session):
+        from app.services.research import STUCK_RUN_SECONDS, reap_stuck_runs
+
+        stale = await self._run(
+            session, status=RunStatus.RUNNING.value, started_ago_s=STUCK_RUN_SECONDS + 60
+        )
+        fresh = await self._run(
+            session, status=RunStatus.RUNNING.value, started_ago_s=120
+        )
+        done = await self._run(
+            session, status=RunStatus.SUCCEEDED.value, started_ago_s=STUCK_RUN_SECONDS * 2
+        )
+
+        reaped = await reap_stuck_runs(session)
+
+        assert [r.id for r in reaped] == [stale.id]
+        assert stale.status == RunStatus.FAILED.value
+        assert stale.finished_at is not None
+        # distinguishable from a genuine failure — the run didn't fail, the
+        # process died under it
+        assert "process died" in stale.error
+        assert fresh.status == RunStatus.RUNNING.value, "in-flight work is not an orphan"
+        assert done.status == RunStatus.SUCCEEDED.value
+
+    async def test_same_day_retry_only_for_todays_lost_scheduled_run(self, session):
+        from app.services.research import (
+            STUCK_RUN_SECONDS,
+            needs_same_day_retry,
+            reap_stuck_runs,
+        )
+
+        # a stale scheduled run from earlier today, and no success since
+        await self._run(
+            session, status=RunStatus.RUNNING.value, started_ago_s=STUCK_RUN_SECONDS + 60
+        )
+        reaped = await reap_stuck_runs(session)
+        assert await needs_same_day_retry(session, reaped) is True
+
+        # a success later today cancels the catch-up
+        await self._run(session, status=RunStatus.SUCCEEDED.value, started_ago_s=30)
+        assert await needs_same_day_retry(session, reaped) is False
+
+    async def test_yesterdays_orphan_needs_no_retry(self, session):
+        from app.services.research import needs_same_day_retry, reap_stuck_runs
+
+        await self._run(
+            session, status=RunStatus.RUNNING.value, started_ago_s=86_400 + 3_600
+        )
+        reaped = await reap_stuck_runs(session)
+        assert len(reaped) == 1
+        assert await needs_same_day_retry(session, reaped) is False
+
+    async def test_manual_orphans_never_trigger_catchup(self, session):
+        from app.services.research import (
+            STUCK_RUN_SECONDS,
+            needs_same_day_retry,
+            reap_stuck_runs,
+        )
+
+        await self._run(
+            session,
+            status=RunStatus.RUNNING.value,
+            started_ago_s=STUCK_RUN_SECONDS + 60,
+            trigger="manual",
+        )
+        reaped = await reap_stuck_runs(session)
+        assert await needs_same_day_retry(session, reaped) is False

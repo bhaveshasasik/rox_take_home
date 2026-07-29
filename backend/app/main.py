@@ -24,8 +24,26 @@ async def lifespan(app: FastAPI):
     configure_logging()
     settings = get_settings()
     await init_db()
+
+    # Reap before the scheduler starts, so run health never shows an orphaned
+    # "running" row alongside a live cycle. At daily cadence a run lost to a
+    # process death costs the whole day — if it was today's scheduled run and
+    # nothing has succeeded since, run the catch-up now rather than waiting
+    # for tomorrow's fire.
+    from app.db import SessionLocal
+    from app.services.research import needs_same_day_retry, reap_stuck_runs
+
+    async with SessionLocal() as session:
+        reaped = await reap_stuck_runs(session)
+        retry = settings.research_scheduler_enabled and await needs_same_day_retry(
+            session, reaped
+        )
+
     start_scheduler()
 
+    if retry:
+        log.warning("today's scheduled run was reaped — running catch-up now")
+        asyncio.create_task(scheduled_research_cycle())
     if settings.research_run_on_startup:
         asyncio.create_task(scheduled_research_cycle())
 
