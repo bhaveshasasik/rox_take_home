@@ -690,6 +690,70 @@ class TestEvidenceValidation:
         assert not evidence_is_contained("", CELL)
         assert not evidence_is_contained("something", "")
 
+    async def test_retry_must_beat_the_first_result_to_replace_it(self, session):
+        """Both passes are independent samples of a nondeterministic call. A
+        retry that fails containment as badly as — or worse than — the first
+        result must not replace it: at ~5 retries per daily cycle, accepting
+        the re-roll unconditionally swaps good extractions for worse ones."""
+        good_span = "No internal CRM activity found for this account."
+        first = ExtractionResult(
+            signals=[
+                SignalDraft(
+                    signal_type=SignalType.CHAMPION_ENGAGEMENT,
+                    confidence=8,
+                    is_absence=True,
+                    rationale="nothing in CRM",
+                    evidence=good_span,
+                ),
+                SignalDraft(
+                    signal_type=SignalType.GROWTH_EXPANSION,
+                    confidence=9,
+                    is_absence=False,
+                    rationale="paraphrased",
+                    evidence="Q2 revenue rose seven percent year over year",
+                ),
+            ]
+        )
+        worse_retry = ExtractionResult(
+            signals=[
+                SignalDraft(
+                    signal_type=SignalType.GROWTH_EXPANSION,
+                    confidence=9,
+                    is_absence=False,
+                    rationale="also paraphrased",
+                    evidence="Revenue grew by a high single digit figure",
+                ),
+                SignalDraft(
+                    signal_type=SignalType.TRIGGER_EVENT,
+                    confidence=7,
+                    is_absence=False,
+                    rationale="also paraphrased",
+                    evidence="A leadership shuffle occurred at Experiences",
+                ),
+            ]
+        )
+        account, _run, artifact = await _artifact(session)
+        with patch(
+            "app.signals.extraction.extract_cell",
+            AsyncMock(side_effect=[first, worse_retry]),
+        ) as call:
+            record, _outcome = await extract_artifact(session, artifact, account.name)
+
+        assert call.await_count == 2
+        rows = (
+            await session.execute(
+                select(ExtractedSignalRow)
+                .where(ExtractedSignalRow.extraction_id == record.id)
+                .order_by(ExtractedSignalRow.position)
+            )
+        ).scalars().all()
+        # The first result stands: its locatable span survives verbatim, and
+        # the retry's two unlocatable signals are nowhere to be seen.
+        assert [r.signal_type for r in rows] == ["champion_engagement", "growth_expansion"]
+        assert rows[0].evidence == good_span
+        assert rows[0].validation_failed is False
+        assert rows[1].validation_failed is True
+
     async def test_unlocatable_evidence_is_discarded_and_flagged(self, session):
         account, _run, artifact = await _artifact(session)
         invented = ExtractionResult(

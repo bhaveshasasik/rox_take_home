@@ -461,20 +461,34 @@ async def extract_artifact(
     # re-run rather than the failing signal alone: the model has no way to
     # revise a single entry, and a second pass over the same cell is the only
     # correction available to it.
-    if result is not None and any(
-        not evidence_is_contained(d.evidence, raw_cell) for d in result.signals
-    ):
+    #
+    # The retry must *win* the comparison, not merely exist. Both passes are
+    # independent samples of the same nondeterministic call — at ~5 retries
+    # per 21-account cycle, accepting the second unconditionally replaces a
+    # good extraction with a worse one whenever the re-roll lands badly.
+    def _containment_failures(extraction: ExtractionResult) -> int:
+        return sum(
+            1 for d in extraction.signals if not evidence_is_contained(d.evidence, raw_cell)
+        )
+
+    if result is not None and _containment_failures(result) > 0:
+        first_failures = _containment_failures(result)
         log.warning(
             "evidence not found in source; retrying extraction",
             account=account_name,
-            failing=sum(
-                1 for d in result.signals if not evidence_is_contained(d.evidence, raw_cell)
-            ),
+            failing=first_failures,
             of=len(result.signals),
         )
         retried = await extract_cell(account_name, raw_cell)
-        if retried is not None:
+        if retried is not None and _containment_failures(retried) < first_failures:
             result = retried
+        elif retried is not None:
+            log.info(
+                "retry kept nothing; first extraction stands",
+                account=account_name,
+                first_failing=first_failures,
+                retry_failing=_containment_failures(retried),
+            )
 
     if result is None:
         record.status = ExtractionStatus.FAILED.value
