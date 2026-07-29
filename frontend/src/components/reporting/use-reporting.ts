@@ -3,15 +3,15 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { api, type ResponseOf } from "@/api/client";
-import { AGING_THRESHOLD_HOURS } from "@/lib/pipeline";
 
 /**
- * One query per chart, deliberately — not a single `/reporting/overview` call.
+ * One `/reporting/overview` call for the whole page.
  *
- * The overview endpoint would couple every chart's fate to one request: a
- * failure anywhere blanks the whole page, which is exactly what we were asked
- * to avoid. Separate queries let each card own its loading, empty, and error
- * state, and they run in parallel anyway.
+ * This replaces the previous one-query-per-chart wiring, by explicit request:
+ * one query, one loading state, one error state. What survives from the old
+ * design is the per-panel *empty* state — each section still decides for
+ * itself what "nothing here" looks like, so one section having no data cannot
+ * blank the page.
  */
 
 export interface DateWindow {
@@ -27,66 +27,34 @@ function windowParams(window: DateWindow) {
   };
 }
 
-export function useFunnel(window: DateWindow) {
-  return useQuery<ResponseOf<"/reporting/funnel", "get">>({
-    queryKey: ["reporting", "funnel", window],
-    queryFn: ({ signal }) =>
-      api.get("/reporting/funnel", { query: windowParams(window), signal }),
-  });
-}
+export type Overview = ResponseOf<"/reporting/overview", "get">;
+export type RunHealth = ResponseOf<"/reporting/run-health", "get">;
 
-export function useScoreCalibration(window: DateWindow) {
-  return useQuery<ResponseOf<"/reporting/score-calibration", "get">>({
-    queryKey: ["reporting", "score-calibration", window],
-    queryFn: ({ signal }) =>
-      // deciles: the whole question is whether the score is predictive, and
-      // four coarse bands cannot show a trend
-      api.get("/reporting/score-calibration", {
-        query: { ...windowParams(window), buckets: 10 },
-        signal,
-      }),
-  });
-}
+/**
+ * Below this many decisions a rate is de-emphasized wherever it renders.
+ * Read from the data at render, never hardcoded into a component's markup.
+ */
+export const LOW_N = 5;
 
-export function useRejectionReasons(window: DateWindow, groupBy: "day" | "week") {
-  return useQuery<ResponseOf<"/reporting/rejection-reasons", "get">>({
-    queryKey: ["reporting", "rejection-reasons", window, groupBy],
+export function useOverview(window: DateWindow) {
+  return useQuery<Overview>({
+    queryKey: ["reporting", "overview", window],
+    // No `buckets` param: the design reads the four fixed score bands, and
+    // deciles at n=11 would put one decision per bar.
     queryFn: ({ signal }) =>
-      api.get("/reporting/rejection-reasons", {
-        query: { ...windowParams(window), group_by: groupBy },
-        signal,
-      }),
-  });
-}
-
-export function useSignalPerformance(window: DateWindow) {
-  return useQuery<ResponseOf<"/reporting/signal-performance", "get">>({
-    queryKey: ["reporting", "signal-performance", window],
-    queryFn: ({ signal }) =>
-      api.get("/reporting/signal-performance", { query: windowParams(window), signal }),
-  });
-}
-
-export function useDecisionLatency(window: DateWindow) {
-  return useQuery<ResponseOf<"/reporting/decision-latency", "get">>({
-    queryKey: ["reporting", "decision-latency", window],
-    queryFn: ({ signal }) =>
-      api.get("/reporting/decision-latency", { query: windowParams(window), signal }),
+      api.get("/reporting/overview", { query: windowParams(window), signal }),
   });
 }
 
 /**
- * Deliberately *not* windowed. "How many are aging right now" is a present-tense
- * fact about the queue; filtering it to a past window would produce a number
- * nobody can act on. The card labels itself as current-state.
+ * Deliberately *not* windowed, and deliberately not read from the overview
+ * response. The overview windows `run_health` along with everything else, but
+ * automation health answers "is the machinery working" — a fact about the
+ * system, not about the reporting period. Its panel is badged accordingly.
  */
-export function useQueueStats() {
-  return useQuery<ResponseOf<"/opportunities/stats", "get">>({
-    queryKey: ["opportunities", "stats", AGING_THRESHOLD_HOURS],
-    queryFn: ({ signal }) =>
-      api.get("/opportunities/stats", {
-        query: { aging_hours: AGING_THRESHOLD_HOURS },
-        signal,
-      }),
+export function useRunHealth() {
+  return useQuery<RunHealth>({
+    queryKey: ["reporting", "run-health"],
+    queryFn: ({ signal }) => api.get("/reporting/run-health", { signal }),
   });
 }
