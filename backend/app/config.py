@@ -23,9 +23,11 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
 
     # Structured signal extraction (app/signals)
-    #: gate for wiring extraction into automatic paths. The admin trigger
-    #: ignores it — that endpoint is the deliberate manual escape hatch.
-    extraction_enabled: bool = False
+    #: On by default since the move to daily cadence: one cycle a day is ~21
+    #: LLM calls, and without extraction the cycle scores — and notifies —
+    #: from the regex parser. Off remains available for calibration work.
+    #: /admin/signals/extract ignores this; it is the manual escape hatch.
+    extraction_enabled: bool = True
     extraction_model: str = "claude-opus-5"
     #: bump to force re-extraction under a changed schema; rows carry the
     #: version they were written at, so the two never get compared

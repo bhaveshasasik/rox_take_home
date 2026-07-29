@@ -206,13 +206,13 @@ async def wait_for_jobs(rox: RoxClient, run_ids: list[str], timeout: int) -> int
 async def _extract_signals(session: AsyncSession, run: ResearchRun) -> None:
     """Structured extraction over the artifacts this run just wrote.
 
-    Off by default (`EXTRACTION_ENABLED`). Cost scales with how often the cycle
-    actually runs, not with the interval setting: the content-hash cache almost
+    On by default (`EXTRACTION_ENABLED`) since the daily cadence. Cost scales
+    with how often the cycle actually runs: the content-hash cache almost
     never fires between cycles because Rox regenerates the research text each
-    time — measured at 4% reuse across 432 artifacts — so each cycle pays for a
-    full pass over every account. That is ~21 calls per cycle at present. A
-    couple of cycles a day is unremarkable; a continuously-running 15-minute
-    schedule would be ~84 an hour, which is the case to watch.
+    time — measured at 4% reuse across 432 artifacts — so each cycle pays for
+    a full pass over every account, ~21 calls. At one run per day that is 21
+    calls a day; the interval fallback is the case to watch, at ~84 an hour
+    if anyone sets it back to 15 minutes.
 
     Runs before `create_opportunities_for_run` because scoring now prefers
     these signals, falling back to `parse_cell` for anything not extracted. An
