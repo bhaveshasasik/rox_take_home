@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api, type ResponseOf } from "@/api/client";
 
@@ -56,5 +56,42 @@ export function useRunHealth() {
   return useQuery<RunHealth>({
     queryKey: ["reporting", "run-health"],
     queryFn: ({ signal }) => api.get("/reporting/run-health", { signal }),
+    // Live while a cycle is in flight: the top row is the running run, and
+    // its ticking duration is the only mid-run progress the UI has. Stops
+    // by itself when the run reaches a terminal status.
+    refetchInterval: (query) =>
+      query.state.data?.recent_runs?.[0]?.status === "running" ? 5_000 : false,
+  });
+}
+
+/**
+ * Start a forced research cycle, detached server-side (`background=true`).
+ *
+ * Detached is not a nicety: a blocking request is cancelled if the client
+ * disconnects — a page reload mid-run would kill the cycle. The server owns
+ * the run; this hook only starts it and watches run-health.
+ */
+export function useTriggerRun() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () =>
+      api.post("/admin/research/run", {
+        query: {
+          background: true,
+          force_extract: true,
+          ignore_cooldown: true,
+        },
+      }),
+    onSuccess: () => {
+      // The running row appears on the next run-health fetch, which also
+      // switches that query into its polling mode.
+      queryClient.invalidateQueries({ queryKey: ["reporting", "run-health"] });
+      // The run ends with new opportunities and a digest; stale queue counts
+      // would misstate what just happened. Polling run-health covers the
+      // transition; these cover the end state whenever the user navigates.
+      queryClient.invalidateQueries({ queryKey: ["opportunities"] });
+      queryClient.invalidateQueries({ queryKey: ["reporting", "overview"] });
+    },
   });
 }

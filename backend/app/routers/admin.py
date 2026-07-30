@@ -6,12 +6,14 @@ scheduler mid-demo is not viable.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db import get_session
+from app.db import SessionLocal, get_session
 from app.logging_config import get_logger
 from app.models import Notification, Opportunity
 from app.rox.client import RoxClient
@@ -32,14 +34,40 @@ log = get_logger(__name__)
 router = APIRouter(tags=["admin"])
 
 
+async def _detached_cycle(
+    *, notify: bool, force_extract: bool, ignore_cooldown: bool
+) -> None:
+    """One manual cycle on its own session, owned by the server, not a request.
+
+    uvicorn cancels a request handler when its client disconnects — so a
+    blocking trigger dies with a page reload, stranding the run row in
+    "running" for the reaper. A detached task belongs to the event loop and
+    survives anything the browser does. Never raises: the run row records
+    its own failure, same contract as the scheduled path.
+    """
+    try:
+        async with SessionLocal() as session, RoxClient() as rox:
+            await run_research_cycle(
+                session,
+                rox,
+                trigger="manual",
+                notify=notify,
+                force_extract=force_extract,
+                ignore_cooldown=ignore_cooldown,
+            )
+    except Exception as exc:  # noqa: BLE001 - keep the loop alive
+        log.error("detached manual cycle failed", error=str(exc)[:500])
+
+
 @router.post("/admin/research/run", response_model=RunTriggerOut)
 async def trigger_research(
     notify: bool = True,
     force_extract: bool = False,
     ignore_cooldown: bool = False,
+    background: bool = False,
     session: AsyncSession = Depends(get_session),
 ) -> RunTriggerOut:
-    """Run one research cycle now; qualifying opportunities notify in batch.
+    """Run one research cycle now; a digest goes out if anything qualifies.
 
     Per-run overrides, recorded on the run row and never persisted anywhere
     else:
@@ -51,7 +79,21 @@ async def trigger_research(
     - `ignore_cooldown` skips the recently-decided cooldown for this run
       only. The open-opportunity guard still applies; superseding is the
       sanctioned way past it.
+    - `background=true` detaches the cycle and returns immediately — the mode
+      a UI must use, because a blocking request is cancelled if the client
+      disconnects, killing the run mid-flight. Watch progress on
+      /reporting/run-health; the top row is this run.
     """
+    if background:
+        asyncio.create_task(
+            _detached_cycle(
+                notify=notify,
+                force_extract=force_extract,
+                ignore_cooldown=ignore_cooldown,
+            )
+        )
+        return RunTriggerOut(started_in_background=True)
+
     async with RoxClient() as rox:
         run = await run_research_cycle(
             session,

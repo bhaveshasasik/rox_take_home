@@ -144,6 +144,31 @@ class TestNotifications:
         assert len(resp.json()) == 1
 
 
+class TestBackgroundTrigger:
+    async def test_background_mode_detaches_and_returns_immediately(
+        self, session, seeded, client
+    ):
+        """The UI's mode: a blocking trigger dies with a client disconnect
+        (uvicorn cancels the handler), so the button must detach the run."""
+        from unittest.mock import AsyncMock, patch
+
+        with patch(
+            "app.routers.admin._detached_cycle", AsyncMock(return_value=None)
+        ) as detached:
+            resp = await client.post(
+                "/admin/research/run"
+                "?background=true&force_extract=true&ignore_cooldown=true"
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["started_in_background"] is True
+        assert body["run"] is None
+        detached.assert_called_once_with(
+            notify=True, force_extract=True, ignore_cooldown=True
+        )
+
+
 class TestDigest:
     def _delivery(self):
         """Patched SMTP + recipient, capturing every send."""

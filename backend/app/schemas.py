@@ -247,8 +247,13 @@ class SequenceOut(BaseModel):
 
 
 class RunTriggerOut(BaseModel):
-    run: ResearchRunOut
+    #: None when the run was started in the background — poll
+    #: /reporting/run-health for progress; the top row is this run.
+    run: ResearchRunOut | None = None
     notified: int = 0
+    #: True when the cycle was detached rather than awaited. A detached run
+    #: survives the client disconnecting, which a blocking request does not.
+    started_in_background: bool = False
 
 
 class RoxIdentityOut(BaseModel):

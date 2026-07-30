@@ -441,7 +441,7 @@ export interface paths {
         put?: never;
         /**
          * Trigger Research
-         * @description Run one research cycle now; qualifying opportunities notify in batch.
+         * @description Run one research cycle now; a digest goes out if anything qualifies.
          *
          *     Per-run overrides, recorded on the run row and never persisted anywhere
          *     else:
@@ -453,6 +453,10 @@ export interface paths {
          *     - `ignore_cooldown` skips the recently-decided cooldown for this run
          *       only. The open-opportunity guard still applies; superseding is the
          *       sanctioned way past it.
+         *     - `background=true` detaches the cycle and returns immediately — the mode
+         *       a UI must use, because a blocking request is cancelled if the client
+         *       disconnects, killing the run mid-flight. Watch progress on
+         *       /reporting/run-health; the top row is this run.
          */
         post: operations["trigger_research_admin_research_run_post"];
         delete?: never;
@@ -1300,12 +1304,17 @@ export interface components {
         RunStatus: "running" | "succeeded" | "partial" | "failed";
         /** RunTriggerOut */
         RunTriggerOut: {
-            run: components["schemas"]["ResearchRunOut"];
+            run?: components["schemas"]["ResearchRunOut"] | null;
             /**
              * Notified
              * @default 0
              */
             notified: number;
+            /**
+             * Started In Background
+             * @default false
+             */
+            started_in_background: boolean;
         };
         /** ScoreBandOut */
         ScoreBandOut: {
@@ -2168,6 +2177,7 @@ export interface operations {
                 notify?: boolean;
                 force_extract?: boolean;
                 ignore_cooldown?: boolean;
+                background?: boolean;
             };
             header?: never;
             path?: never;

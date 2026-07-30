@@ -20,6 +20,7 @@ import { HeadlineStrip } from "./headline-strip";
 import { LatencyPanel } from "./latency-panel";
 import { RejectionChart } from "./rejection-chart";
 import { RunHealthPanel } from "./run-health-panel";
+import { RunNowButton } from "./run-now-button";
 import { SignalChart } from "./signal-chart";
 import { YieldPanel } from "./yield-panel";
 import { useOverview } from "./use-reporting";
@@ -78,6 +79,7 @@ export function ReportingView() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <RunNowButton />
           <DateRangeFilter value={range} onChange={selectRange} />
           <Link
             href="/"
