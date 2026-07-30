@@ -756,22 +756,39 @@ class TestStuckRunReaper:
         assert done.status == RunStatus.SUCCEEDED.value
 
     async def test_same_day_retry_only_for_todays_lost_scheduled_run(self, session):
+        """Frozen clock at noon: with wall time, "a stale run from earlier
+        today" cannot exist in the first hour after UTC midnight — the stuck
+        threshold reaches into yesterday — and the test failed only then."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
         from app.services.research import (
-            STUCK_RUN_SECONDS,
             needs_same_day_retry,
             reap_stuck_runs,
         )
 
-        # a stale scheduled run from earlier today, and no success since
-        await self._run(
-            session, status=RunStatus.RUNNING.value, started_ago_s=STUCK_RUN_SECONDS + 60
-        )
-        reaped = await reap_stuck_runs(session)
-        assert await needs_same_day_retry(session, reaped) is True
+        noon = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+        with patch("app.services.research.utcnow", return_value=noon):
+            # a stale scheduled run from earlier "today", no success since
+            stale = await self._run(
+                session, status=RunStatus.RUNNING.value, started_ago_s=0
+            )
+            stale.started_at = (
+                noon.replace(hour=7).replace(tzinfo=None)
+            )
+            await session.commit()
 
-        # a success later today cancels the catch-up
-        await self._run(session, status=RunStatus.SUCCEEDED.value, started_ago_s=30)
-        assert await needs_same_day_retry(session, reaped) is False
+            reaped = await reap_stuck_runs(session)
+            assert [r.id for r in reaped] == [stale.id]
+            assert await needs_same_day_retry(session, reaped) is True
+
+            # a success later "today" cancels the catch-up
+            ok = await self._run(
+                session, status=RunStatus.SUCCEEDED.value, started_ago_s=0
+            )
+            ok.started_at = noon.replace(hour=11).replace(tzinfo=None)
+            await session.commit()
+            assert await needs_same_day_retry(session, reaped) is False
 
     async def test_yesterdays_orphan_needs_no_retry(self, session):
         from app.services.research import needs_same_day_retry, reap_stuck_runs
